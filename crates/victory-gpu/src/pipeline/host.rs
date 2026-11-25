@@ -1271,7 +1271,7 @@ mod tests {
                     for (record, offset) in records.iter().zip([0, 32]) {
                         l.SetGraphicsRoot32BitConstant(0, record[0], 0);
                         l.SetGraphicsRoot32BitConstant(1, record[1], 0);
-                        l.ExecuteIndirect(&single, 1, &source_args, offset, None, 0);
+                        l.ExecuteIndirect(single, 1, &source_args, offset, None, 0);
                     }
                 }
                 l.ResourceBarrier(&[crate::host::transition(&color, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);

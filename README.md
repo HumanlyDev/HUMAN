@@ -7,6 +7,9 @@ An experimental Xbox Series X|S to Windows x86-64 / Direct3D 12 compatibility la
 > **Important Notice (No Game Files Included):**
 > This repository contains **only original compatibility-layer source code and documentation**. No game executables, archives, shaders, textures, audio, keys, or proprietary assets are included or distributed here. You must supply your own legally obtained files stored **outside** the repository (enforced by `.gitignore` and `cargo xtask policy`). This project is not affiliated with or endorsed by Microsoft or any game developer or publisher.
 
+> **Optimization Pull Requests Wanted:**
+> We are actively looking for **Pull Requests focused on CPU, GPU, memory, and shader optimizations**! See [Contributing & Optimization Targets](#contributing--optimization-targets) below for the highest-impact bottlenecks.
+
 ---
 
 ## Key Features & Enhancements
@@ -131,6 +134,29 @@ When no XInput controller is connected, the keyboard maps to a standard pad whil
 | `VICTORY_INDIRECT_WINDOW` | `1` | Clamps consecutive indirect draws in batch windows |
 | `VICTORY_SHADER_LOOP_LIMIT_CS` | `192` | Caps compute shader loop iterations per lane (part of cache key) |
 | `VICTORY_FPS_LIMIT` | `0` / `30` / `60` | Caps host presentation rate |
+
+---
+
+## Contributing & Optimization Targets
+
+**Pull requests for performance and memory optimizations are very welcome.** Whether it's shaving microseconds off per-draw CPU overhead, reducing GPU command-list barriers, improving VRAM residency on 8 GB cards, or tightening DXIL shader codegen, every measurable improvement helps.
+
+High-impact areas to target:
+
+1. **Indirect Execution & Draw Submission (`crates/victory-gpu/src/indirect.rs`, `draw.rs`):**
+   - Reducing per-record argument clamping overhead and coalescing barriers/dispatches across indirect draw windows.
+   - Cutting per-draw descriptor table, root-parameter, and command-signature overhead.
+2. **CPU <-> GPU Shadow Memory & Relay (`crates/victory-gpu/src/shadow.rs`, `plaincopy.rs`, `inplace.rs`):**
+   - Optimizing dirty-page scanning, SIMD diff/merge throughput, and copy-back latency.
+   - Expanding safe zero-copy `VICTORY_INPLACE` heap coverage.
+3. **8 GB VRAM Residency & Texture Streaming (`crates/victory-gpu/src/texture.rs`, `tiles.rs`, `placed.rs`):**
+   - Faster tiled/BC detiling, lower staging allocation churn, and smarter eviction under tight DXGI memory budgets.
+4. **Shader Recompiler & DXIL Passes (`crates/victory-shader`):**
+   - Tighter Wave64-on-Wave32 lowering, eliminating redundant lane/waterfall operations, and faster pipeline compilation.
+
+Before opening a PR, please verify:
+- `cargo test --workspace` passes.
+- `cargo run -p xtask -- policy` passes with zero violations (strict zero-game-asset rule).
 
 ---
 

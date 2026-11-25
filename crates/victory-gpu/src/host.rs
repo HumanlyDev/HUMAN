@@ -8061,7 +8061,7 @@ impl Meter {
         }
         let Some(caption) = &self.caption else { return };
         let text = format!(
-            " | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame | shaders queued {} | textures queued {}",
+            " | HUMAN {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame | shaders queued {} | textures queued {}",
             crate::pipeline::making(),
             crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed)
         );
@@ -8075,7 +8075,7 @@ impl Meter {
         *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some((hwnd.0 as usize, text));
         SETTER.call_once(|| {
             let _ = std::thread::Builder::new()
-                .name("victory-caption".into())
+                .name("human-caption".into())
                 .spawn(|| {
                     loop {
                         let next = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -8697,7 +8697,7 @@ fn toggle_borderless(hwnd: HWND) {
 }
 
 fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
-    const CLASS: PCWSTR = w!("VIctory");
+    const CLASS: PCWSTR = w!("HUMAN");
     // SAFETY: registers our class once and creates a window of it.
     unsafe {
         let instance = GetModuleHandleW(None)?;
@@ -8720,7 +8720,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
-            w!("VIctory"),
+            w!("HUMAN"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,

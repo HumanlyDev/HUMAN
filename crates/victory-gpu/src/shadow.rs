@@ -1856,7 +1856,10 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let mut runs = Vec::new();
     let mut i = 0;
     while i < n {
-        // Equal bytes, eight at a time while they last.
+        // Equal bytes, 32 (SIMD) then 8 at a time while they last.
+        while i + DIFF_CHUNK <= n && now[i..i + DIFF_CHUNK] == was[i..i + DIFF_CHUNK] {
+            i += DIFF_CHUNK;
+        }
         while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
             i += 8;
         }
@@ -1867,6 +1870,16 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
             break;
         }
         let first = i;
+        // Differing bytes, 8 at a time whenever all 8 bytes differ (no zero bytes in XOR).
+        while i + 8 <= n {
+            let a = u64::from_ne_bytes(now[i..i + 8].try_into().unwrap());
+            let b = u64::from_ne_bytes(was[i..i + 8].try_into().unwrap());
+            let xor = a ^ b;
+            if (xor.wrapping_sub(0x0101_0101_0101_0101) & !xor & 0x8080_8080_8080_8080) != 0 {
+                break;
+            }
+            i += 8;
+        }
         while i < n && now[i] != was[i] {
             i += 1;
         }

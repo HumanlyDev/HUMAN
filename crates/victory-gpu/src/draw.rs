@@ -2632,17 +2632,23 @@ impl State {
         compute: bool,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        let mut fresh = [0u64; 4];
+        let mark_fresh = |set: &mut [u64; 4], slot: u8| {
+            set[usize::from(slot >> 6)] |= 1u64 << (slot & 63);
+        };
+        let has_fresh = |set: &[u64; 4], slot: u8| -> bool {
+            (set[usize::from(slot >> 6)] & (1u64 << (slot & 63))) != 0
+        };
+        for u in used.iter().filter(tables) {
+            if u.kind == ResourceType::Cbv {
+                mark_fresh(&mut fresh, u.slot);
+            }
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+            if has_fresh(&fresh, u.slot) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -2656,21 +2662,26 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                mark_fresh(&mut fresh, u.slot);
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+            if !has_fresh(&fresh, u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
+        if fresh == [0; 4] {
+            return Vec::new();
+        }
         let mut made = Vec::new();
-        for slot in fresh {
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
-                continue;
-            };
+        for (word_idx, mut bits) in fresh.into_iter().enumerate() {
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as u8;
+                bits &= bits - 1;
+                let slot = ((word_idx as u8) << 6) | bit;
+                let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                    continue;
+                };
             let entries: Vec<&UsedResource> = used
                 .iter()
                 .filter(tables)
@@ -2804,6 +2815,7 @@ impl State {
                 }
             }
             made.push((slot, first * 32));
+            }
         }
         made
     }
@@ -3255,7 +3267,7 @@ impl State {
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
             list.list.ExecuteIndirect(
-                &signature,
+                signature,
                 max,
                 &bounded,
                 at,
@@ -3283,12 +3295,26 @@ impl State {
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
-pub(crate) fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
-    static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
-        std::sync::Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        return Some(s.clone());
+pub(crate) fn host_signature(kind: u32, stride: u32) -> Option<&'static ID3D12CommandSignature> {
+    type Entry = ((u32, u32), &'static ID3D12CommandSignature);
+    static MADE: std::sync::RwLock<Vec<Entry>> = std::sync::RwLock::new(Vec::new());
+    thread_local! {
+        static LAST: std::cell::Cell<Option<Entry>> = const { std::cell::Cell::new(None) };
+    }
+    let key = (kind, stride);
+    if let Some((cached_key, sig)) = LAST.with(|c| c.get())
+        && cached_key == key
+    {
+        return Some(sig);
+    }
+    if let Some(&(_, s)) = MADE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(k, _)| *k == key)
+    {
+        LAST.with(|c| c.set(Some((key, s))));
+        return Some(s);
     }
     let argument = D3D12_INDIRECT_ARGUMENT_DESC {
         Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
@@ -3314,8 +3340,16 @@ pub(crate) fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSign
         return None;
     }
     let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
-    Some(signature)
+    let mut made = MADE.write().unwrap_or_else(|e| e.into_inner());
+    let sig = if let Some(&(_, existing)) = made.iter().find(|(k, _)| *k == key) {
+        existing
+    } else {
+        let leaked: &'static ID3D12CommandSignature = Box::leak(Box::new(signature));
+        made.push((key, leaked));
+        leaked
+    };
+    LAST.with(|c| c.set(Some((key, sig))));
+    Some(sig)
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
