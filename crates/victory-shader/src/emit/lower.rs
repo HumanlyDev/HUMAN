@@ -61,8 +61,8 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
-    /// Bit n: immediate sampler n is used for comparisons.
-    pub cmp_samplers: u64,
+    /// Per-slot flag: immediate sampler `n` is used for comparisons.
+    pub cmp_samplers: Vec<bool>,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
@@ -226,7 +226,7 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
-    samplers: Vec<[u32; 4]>,
+    samplers: Vec<([u32; 4], bool)>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
@@ -2415,7 +2415,8 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
-        let cmp_samplers = self.s.cmp_samplers;
+        let cmp_samplers = std::mem::take(&mut self.s.cmp_samplers);
+        let samplers = self.samplers.into_iter().map(|(w, _)| w).collect();
         let wave_size = self.s.wave_size;
         #[cfg(test)]
         let nonuniform_handles = self.s.nonuniform_handles;
@@ -2439,7 +2440,7 @@ impl<'a> Lower<'a> {
             memory_ir,
             dxil,
             user_data,
-            samplers: self.samplers,
+            samplers,
         })
     }
 
@@ -6763,24 +6764,22 @@ impl<'a> Lower<'a> {
     }
 
     /// A handle for the descriptor `src` read at `site`.
-    /// Registers an immediate sampler's words and returns its static sampler slot.
+    /// Registers an immediate sampler's words and comparison mode and returns
+    /// its static sampler slot. A constant used both for normal and comparison
+    /// sampling gets two distinct static samplers.
     fn sampler_slot(&mut self, words: &[u32], cmp: bool) -> Result<u32, Why> {
         let words: [u32; 4] = words
             .get(..4)
             .and_then(|w| w.try_into().ok())
             .ok_or("a sampler constant")?;
-        let n = match self.samplers.iter().position(|w| *w == words) {
+        let n = match self.samplers.iter().position(|&entry| entry == (words, cmp)) {
             Some(n) => n,
             None => {
-                self.samplers.push(words);
+                self.samplers.push((words, cmp));
+                self.s.cmp_samplers.push(cmp);
                 self.samplers.len() - 1
             }
         };
-        if cmp {
-            // shortcut: one sampler used with and without comparison
-            // would need two static samplers; it becomes a comparison one.
-            self.s.cmp_samplers |= 1 << n;
-        }
         Ok(n as u32)
     }
 
@@ -12968,5 +12967,47 @@ mod tests {
         )
         .expect("Source::Phi of immediate constant samplers");
         assert_eq!(out.samplers.len(), 2);
+    }
+
+    #[test]
+    fn same_immediate_sampler_used_with_and_without_comparison_gets_two_slots() {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+            0xBE90_0380, // s_mov_b32 s16, 0
+            0xBE91_0380, // s_mov_b32 s17, 0
+            0xBE92_0380, // s_mov_b32 s18, 0
+            0xBE93_0380, // s_mov_b32 s19, 0
+            0xF09C_0F08,
+            0x0082_0402, // image_sample_lz v[4:7], v[2:3], s[8:15], s[16:19]
+            0xF0BC_0108,
+            0x0082_0801, // image_sample_c_lz v8, v[1:3], s[8:15], s[16:19] (dmask = 0x1)
+            0xD834_0000,
+            0x0000_0400, // ds_write_b32 v0, v4
+            0xD834_0000,
+            0x0000_0800, // ds_write_b32 v0, v8
+            S_ENDPGM,
+        ];
+        let out = lower_with(
+            &words,
+            vec![root(RootType::Table, 0, 0)],
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            }],
+        )
+        .expect("mixed comparison and non-comparison immediate sampler");
+        assert_eq!(out.samplers.len(), 2);
+        assert_eq!(out.samplers[0], out.samplers[1]);
+        assert_eq!(out.cmp_samplers, vec![false, true]);
+        assert!(crate::Container::parse(&out.dxil).is_ok());
     }
 }

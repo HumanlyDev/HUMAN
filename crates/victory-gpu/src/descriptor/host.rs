@@ -2923,11 +2923,8 @@ fn buffer_uav(
 /// view; the host refuses (and removes the device for) views without the
 /// resource's permission, of typed depth, and in another format than a
 /// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format, except an RGBA8 shader view that
-/// asks for sRGB or linear on a host that allows the cast
-/// ([`keeps_gamma_view`]).
-/// shortcut: other such views (BGRA8 sRGB of UNORM, say) still read
-/// without their conversion.
+/// family takes the texture's format, except a shader view that asks for
+/// sRGB or linear on a host that allows the cast ([`keeps_gamma_view`]).
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
@@ -2986,15 +2983,16 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
 }
 
 /// Whether a shader view in format `view` of a typed texture in format
-/// `own` keeps its own format: an RGBA8 view that picks sRGB or linear,
-/// on a host that allows views of typed textures in other formats of their
-/// family. Replacing the format there dropped the conversion, so an sRGB
-/// view of a UNORM texture read its texels as linear (#578).
-/// Unordered access views have no sRGB on the host and stay as they were.
+/// `own` keeps its own format: a view that picks sRGB or linear within the
+/// same format family, on a host that allows views of typed textures in
+/// other formats of their family. Replacing the format there dropped the
+/// conversion, so an sRGB view of a UNORM texture read its texels as
+/// linear (#578). Unordered access views have no sRGB on the host and stay
+/// as they were.
 fn keeps_gamma_view(own: u32, view: u32, unordered: bool) -> bool {
-    const RGBA8_UNORM: u32 = DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32;
-    const RGBA8_SRGB: u32 = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB.0 as u32;
-    let gamma_pair = matches!((own, view), (RGBA8_UNORM, RGBA8_SRGB) | (RGBA8_SRGB, RGBA8_UNORM));
+    let gamma_pair = crate::resource::SRGB
+        .iter()
+        .any(|&(srgb, linear)| (own, view) == (linear, srgb) || (own, view) == (srgb, linear));
     !unordered && gamma_pair && host().is_some_and(|gpu| gpu.typed_format_casting())
 }
 
@@ -3840,6 +3838,64 @@ mod tests {
         }
     }
 
+    /// BGRA8, BGRX8, and BC1 textures viewed across sRGB <-> linear keep their
+    /// view's conversion when the host supports typed format casting.
+    #[test]
+    fn bgra8_and_bc_views_keep_their_srgb_conversion() {
+        const LINEAR_BYTE: f32 = 128.0 / 255.0;
+        const SRGB_BYTE: f32 = 0.215_860_5;
+        // BC1 block with color0 = 0x8410 (R=16/31), color1 = 0, index 0 for all texels.
+        const BC1_BLOCK: [u8; 8] = [0x10, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        const BC1_LINEAR: f32 = 16.0 / 31.0;
+        const BC1_SRGB: f32 = 0.229_23;
+        let Some(gpu) = host() else {
+            return;
+        };
+        let casting = gpu.typed_format_casting();
+        for (unorm, srgb) in [
+            (DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB),
+            (DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM_SRGB),
+        ] {
+            for (texture_format, view_format) in [(unorm, srgb), (srgb, unorm)] {
+                let read_as = if casting { view_format } else { texture_format };
+                let expected = if read_as == srgb { SRGB_BYTE } else { LINEAR_BYTE };
+                let red = sample_one_texel(&gpu.device, texture_format, view_format)
+                    .expect("the sample ran");
+                assert!(
+                    (red - expected).abs() < 0.002,
+                    "texture {} viewed as {}: red {red}, expected {expected}",
+                    texture_format.0,
+                    view_format.0
+                );
+            }
+        }
+        for (texture_format, view_format) in [
+            (DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC1_UNORM_SRGB),
+            (DXGI_FORMAT_BC1_UNORM_SRGB, DXGI_FORMAT_BC1_UNORM),
+        ] {
+            let read_as = if casting { view_format } else { texture_format };
+            let expected = if read_as == DXGI_FORMAT_BC1_UNORM_SRGB {
+                BC1_SRGB
+            } else {
+                BC1_LINEAR
+            };
+            let red = sample_texel(&gpu.device, texture_format, view_format, 4, 4, &BC1_BLOCK)
+                .expect("the BC1 sample ran");
+            assert!(
+                (red - expected).abs() < 0.002,
+                "BC1 texture {} viewed as {}: red {red}, expected {expected}",
+                texture_format.0,
+                view_format.0
+            );
+        }
+        // BC2/BC3/BC7 pairs are also preserved in `keeps_gamma_view` under relaxed casting.
+        for &(srgb, linear) in crate::resource::SRGB.iter() {
+            assert_eq!(keeps_gamma_view(linear, srgb, false), casting);
+            assert_eq!(keeps_gamma_view(srgb, linear, false), casting);
+            assert!(!keeps_gamma_view(linear, srgb, true));
+        }
+    }
+
     /// Fills a 1x1 texture in `texture_format` with 0x80 in every channel,
     /// makes a shader view of it in `view_format` the way the title's views
     /// are made ([`fits`]), and returns the red channel a compute shader
@@ -3848,6 +3904,18 @@ mod tests {
         device: &ID3D12Device,
         texture_format: DXGI_FORMAT,
         view_format: DXGI_FORMAT,
+    ) -> windows::core::Result<f32> {
+        sample_texel(device, texture_format, view_format, 1, 1, &[0x80; 4])
+    }
+
+    /// Shared helper for [`sample_one_texel`] and block-compressed gamma tests.
+    fn sample_texel(
+        device: &ID3D12Device,
+        texture_format: DXGI_FORMAT,
+        view_format: DXGI_FORMAT,
+        width: u64,
+        height: u32,
+        bytes: &[u8],
     ) -> windows::core::Result<f32> {
         const SHADER: &str = "#define RS \"DescriptorTable(SRV(t0)), UAV(u0)\"\n\
             Texture2D<float4> texel : register(t0);\n\
@@ -3861,8 +3929,8 @@ mod tests {
         let default_heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
         let texture_desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-            Width: 1,
-            Height: 1,
+            Width: width,
+            Height: height,
             DepthOrArraySize: 1,
             MipLevels: 1,
             Format: texture_format,
@@ -3910,7 +3978,7 @@ mod tests {
         // SAFETY: the mapping holds the buffer's bytes until unmapped.
         unsafe {
             upload.Map(0, None, Some(&mut mapped))?;
-            mapped.cast::<u8>().write_bytes(0x80, 4);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
             upload.Unmap(0, None);
         }
 
@@ -3964,8 +4032,8 @@ mod tests {
                         Offset: 0,
                         Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
                             Format: texture_format,
-                            Width: 1,
-                            Height: 1,
+                            Width: width as u32,
+                            Height: height,
                             Depth: 1,
                             RowPitch: ROW_PITCH as u32,
                         },

@@ -41,6 +41,7 @@ if (-not $Title -or -not (Test-Path $Title)) {
 
 $env:XCL_ADAPTER = 'nvidia'
 $env:VICTORY_AMBIENT = $Ambient
+$env:VICTORY_BVH_HOLD = '1'
 $env:VICTORY_TEXTURE_DROP_MIPS = "$DropMips"
 $env:VICTORY_LEVELS_ON_DEMAND = '1'
 $env:VICTORY_PLACED_TEX = '1'
