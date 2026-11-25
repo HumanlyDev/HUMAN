@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      # The version and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy, diagnostics build
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Includes xtask's repository_passes_policy, the asset-policy check.
+      - name: Tests
+        run: cargo test --workspace --locked
+      - name: Resource collector smoke test
+        shell: powershell
+        run: |
+          $rows = @(.\tools\watch-resources.ps1 -ProcessId $PID -Samples 2 -IntervalSeconds 1 |
+              ForEach-Object { $_ | ConvertFrom-Json })
+          $session = @($rows | Where-Object kind -eq session)
+          $samples = @($rows | Where-Object kind -eq sample)
+          if ($session.Count -ne 1 -or !($session[0].data.cargo_packages -like 'victory *')) {
+              throw 'Missing Cargo package inventory'
+          }
+          if ($samples.Count -ne 2 -or $samples[1].pid -ne $PID -or
+              $null -ne $samples[0].data.process.cpu_cores -or $null -eq $samples[1].data.process.cpu_cores -or
+              $samples[1].data.process.working_set_bytes -le 0) { throw 'Invalid process samples' }
