@@ -951,6 +951,9 @@ pub(crate) struct HostList {
     window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
+    /// Set by [`HostList::pass_plane`] when it binds its own graphics state
+    /// mid-list so [`crate::draw::State`] replays title state before drawing.
+    plane_clobbered: std::sync::atomic::AtomicBool,
     /// The pair of timestamps its run is timed with since its last reset
     /// (`crate::cardmeter`), or none.
     meter: AtomicU32,
@@ -1008,9 +1011,6 @@ struct TwinUse {
     behind: [Option<bool>; 2],
     /// The draw or dispatch being prepared writes the twin.
     writing: bool,
-    /// The depth plane's twin holds what the plane lacks although the list
-    /// copied the twins since: the plane's pass waits for the list's close.
-    late: bool,
 }
 
 /// The pass that draws the twin of a depth plane into the plane: one
@@ -3997,6 +3997,7 @@ impl Host {
                 indirect_args: Mutex::default(),
                 window_check: OnceLock::new(),
                 _alive: Counted::new(),
+                plane_clobbered: std::sync::atomic::AtomicBool::new(false),
                 meter: AtomicU32::new(u32::MAX),
                 #[cfg(feature = "diagnostics")]
                 samples: Mutex::default(),
@@ -6193,6 +6194,7 @@ impl HostList {
         self.deferred().clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.plane_clobbered.store(false, Ordering::Relaxed);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6278,6 +6280,12 @@ impl HostList {
         }
     }
 
+    /// Returns and clears whether [`HostList::pass_plane`] replaced graphics
+    /// pipeline/target state mid-list.
+    pub(crate) fn take_plane_clobbered(&self) -> bool {
+        self.plane_clobbered.swap(false, Ordering::Relaxed)
+    }
+
     /// A use of title texture `resource` about to be recorded, if it is a
     /// depth texture with a colour twin (false if it is not): of the twin
     /// (`colour`: unordered access) or of the depth texture (depth target,
@@ -6288,10 +6296,10 @@ impl HostList {
     /// unordered access state; the caller moves the depth texture to the
     /// state its use needs, as for any texture. A twin still ahead when the
     /// list closes is copied then (`twins_to_depth`).
-    /// shortcut: every depth target bound for a draw counts as written
-    /// (also when the draw only tests), and every unordered access view a
-    /// shader names as written; views a shader picks from the heap by a
-    /// computed index are not seen here at all.
+    /// shortcut: every depth target bound for a draw writes as noted by
+    /// `write`, and every unordered access view a shader names as written;
+    /// views a shader picks from the heap by a computed index are not seen
+    /// here at all.
     pub(crate) fn twin_use(
         &self,
         resource: crate::object::This,
@@ -6316,7 +6324,6 @@ impl HostList {
                 needs: [false; 2],
                 behind: [None; 2],
                 writing: false,
-                late: false,
             });
         let copy = match u.behind[side] {
             Some(behind) => behind,
@@ -6334,18 +6341,12 @@ impl HostList {
             (true, false) => u.behind[1] = Some(true),
             (false, _) => {}
         }
-        // shortcut: the depth plane's twin is not drawn into the plane
-        // here: the pass sets a pipeline and a target of ours, which a list
-        // still recording the title's commands cannot take. This use sees
-        // the plane as it was; the pass runs when the list closes
-        // (`twins_to_depth`). Counted.
-        if copy && !colour && twin.plane.is_some() {
-            u.late = true;
-            crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
-        }
         drop(twins);
         if copy {
             self.twin_copy(&depth, &twin, colour);
+            if !colour {
+                self.pass_plane(&depth, &twin);
+            }
         } else if colour {
             self.settle(&twin.colour, UNORDERED_ACCESS);
         }
@@ -6358,9 +6359,9 @@ impl HostList {
 
     /// Records the pass that draws the twin of the depth plane of `depth`
     /// into the plane, if `twin` has one, with the moves to the states the
-    /// pass needs; the twin is left in the unordered access state. Only
-    /// for a list that records nothing of the title's afterwards
-    /// (`record_plane_pass`).
+    /// pass needs; the twin is left in the unordered access state. Callers
+    /// recording more title commands afterward check [`take_plane_clobbered`]
+    /// to replay state (`record_plane_pass`).
     fn pass_plane(
         &self,
         depth: &std::sync::Arc<crate::resource::HostTexture>,
@@ -6373,6 +6374,7 @@ impl HostList {
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
         record_plane_pass(&self.list, &depth.texture, &plane.texture);
+        self.plane_clobbered.store(true, Ordering::Relaxed);
         self.settle(plane, UNORDERED_ACCESS);
     }
 
@@ -6410,21 +6412,15 @@ impl HostList {
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let written: Vec<_> = twins
             .values_mut()
-            .filter(|u| u.behind[0] == Some(true) || u.late)
+            .filter(|u| u.behind[0] == Some(true))
             .map(|u| {
-                // Not copied again if the list copied since the last write
-                // and only the depth plane's pass is left.
-                let copy = u.behind[0] == Some(true);
                 u.behind[0] = Some(false);
-                u.late = false;
-                (u.depth.clone(), u.twin.clone(), copy)
+                (u.depth.clone(), u.twin.clone())
             })
             .collect();
         drop(twins);
-        for (depth, twin, copy) in &written {
-            if *copy {
-                self.twin_copy(depth, twin, false);
-            }
+        for (depth, twin) in &written {
+            self.twin_copy(depth, twin, false);
             // Nothing of the title's is recorded after this: the pass may
             // leave its own pipeline and target set.
             self.pass_plane(depth, twin);
@@ -6450,6 +6446,8 @@ impl HostList {
     fn prelude(&self) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
+        const DEPTH_WRITE: u32 = 0x10;
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
@@ -6471,11 +6469,15 @@ impl HostList {
         }
         drop(twins);
         // A copy runs with its textures in the copy states: each moves
-        // there from its real state, and from there to the state the list
-        // starts with (back to its real state if the list does not use it).
+        // there from its real state, any depth-plane pass draws from its
+        // plane twin to `DEPTH_WRITE`, and then everything moves to the state
+        // the list starts with (back to its real state if unused by the list).
         let mut to_copy = Vec::new();
+        let mut to_plane = Vec::new();
         let mut barriers = Vec::new();
         let mut copying = std::collections::HashMap::new();
+        let mut plane_syncs = Vec::new();
+        let mut touched = Vec::new();
         for (depth, twin, colour) in &syncs {
             let (from, to) = if *colour {
                 (depth, &twin.colour)
@@ -6486,20 +6488,62 @@ impl HostList {
                 let key = std::sync::Arc::as_ptr(texture) as usize;
                 let real = texture.state.load(Ordering::Relaxed);
                 copying.insert(key, state);
+                touched.push(texture);
                 if real != state {
                     to_copy.push(transition(
                         &texture.texture,
                         host_state(real),
                         host_state(state),
                     ));
-                    if !states.contains_key(&key) {
-                        barriers.push(transition(
-                            &texture.texture,
-                            host_state(state),
-                            host_state(real),
-                        ));
-                    }
                 }
+            }
+            if !*colour && let Some(plane) = &twin.plane {
+                let depth_key = std::sync::Arc::as_ptr(depth) as usize;
+                let depth_from = copying.get(&depth_key).copied().unwrap_or(COPY_DEST);
+                let plane_key = std::sync::Arc::as_ptr(plane) as usize;
+                let plane_from = copying
+                    .get(&plane_key)
+                    .copied()
+                    .unwrap_or_else(|| plane.state.load(Ordering::Relaxed));
+                let depth_to = legal_state(&depth.texture, DEPTH_WRITE);
+                let plane_to = legal_state(&plane.texture, PIXEL_SHADER_RESOURCE);
+                if depth_from != depth_to {
+                    to_plane.push(transition(
+                        &depth.texture,
+                        host_state(depth_from),
+                        host_state(depth_to),
+                    ));
+                }
+                if plane_from != plane_to {
+                    to_plane.push(transition(
+                        &plane.texture,
+                        host_state(plane_from),
+                        host_state(plane_to),
+                    ));
+                }
+                copying.insert(depth_key, depth_to);
+                copying.insert(plane_key, plane_to);
+                touched.push(plane);
+                plane_syncs.push((depth, plane));
+            }
+        }
+        for texture in touched {
+            let key = std::sync::Arc::as_ptr(texture) as usize;
+            if !states.contains_key(&key)
+                && let Some(at_end) = copying.remove(&key)
+            {
+                let real = texture.state.load(Ordering::Relaxed);
+                if at_end != real {
+                    barriers.push(transition(
+                        &texture.texture,
+                        host_state(at_end),
+                        host_state(real),
+                    ));
+                }
+            } else if !states.contains_key(&key) {
+                // Already handled above if deduplicated.
+            } else {
+                // Handled in `states` loop below using `copying`.
             }
         }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
@@ -6528,6 +6572,12 @@ impl HostList {
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                if !to_plane.is_empty() {
+                    list.ResourceBarrier(&to_plane);
+                }
+                for (depth, plane) in &plane_syncs {
+                    record_plane_pass(list, &depth.texture, &plane.texture);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -7865,7 +7915,7 @@ impl Meter {
             let held = crate::pipeline::WALKS_HELD.swap(0, Ordering::Relaxed);
             if held > 0 {
                 tracing::info!(
-                    "dispatches of programs that walk ray-tracing structures held back per frame (VICTORY_BVH_HOLD=1; the                      builder has not built them): {:.1}",
+                    "dispatches of programs that walk ray-tracing structures held back per frame (VICTORY_BVH_HOLD=0 to allow; the builder has not built them): {:.1}",
                     held as f64 / frames
                 );
             }
