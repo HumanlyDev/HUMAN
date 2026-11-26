@@ -14,12 +14,15 @@ An experimental Xbox Series X|S to Windows x86-64 / Direct3D 12 compatibility la
 
 ## Current Compatibility & Performance Status
 
-| Metric | Status |
+| Milestone | Status |
 |---|---|
-| **RTX 4060 (8 GB) Performance** | **~8 FPS** baseline (tuned for **10+ FPS** with optimized Ray-Traced Global Illumination enabled; higher on upper-tier RTX / Radeon GPUs) |
-| **Story Progression** | **~50% of the main story** reachable |
-| **Rendering & Global Illumination** | **Lit / close to console** — full console Ray-Traced Global Illumination (`ScreenProbes`, `IrradianceCache`, `PrimaryProbes`, `SkyVisibility`, `RaytracingResolve`) via Wave32-compatible `XboxBvhBuilder` + accelerated inline DXIL ray-node traversal, plus directional screen-space SH radiance fallback when RT is disabled |
-| **Stability** | **Good stability — rarely crashes** (Pareto VRAM/commit residency budgets, upload-before-publish bindless barriers, cold BVH arena page recycling, and CPU texture read-back for water/physics) |
+| **Executable & Boot** | ✅ — GTA VI executable loads and runs, imports resolve, and boots to its first frame, intro logos, and loading screen |
+| **Main Menu** | ✅ — GTA VI reaches the main menu and title screen with working controller and keyboard input |
+| **Open World & Playability** | ✅ — GTA VI loads into story mode and the open world with playable gameplay, character movement, driving, controller input, and pause menu |
+| **Performance (RTX 4060 8 GB)** | **5 FPS average** in GTA VI's open world on an NVIDIA RTX 4060 (8 GB) using `--console series-s` with optimized Ray-Traced Global Illumination enabled (higher on upper-tier RTX and Radeon GPUs) |
+| **Story Progress** | **Half the story (~50% of the GTA VI main story)** reachable through the prologue, early missions, and first act |
+| **Rendering & Lighting** | **Close to the console (lit)** — GTA VI renders lit with textures, shadows, and console Ray-Traced Global Illumination (`ScreenProbes`, `IrradianceCache`, `PrimaryProbes`, `SkyVisibility`, `RaytracingResolve`) via Wave32-compatible `XboxBvhBuilder` and accelerated inline DXIL ray-node traversal; directional screen-space SH radiance fallback is also supported |
+| **Stability** | **Rarely crashes** — GTA VI runs with good stability across sessions via Pareto VRAM/commit residency budgets, upload-before-publish bindless barriers, cold BVH arena page recycling, and CPU texture read-back for water/physics |
 
 ---
 
@@ -94,7 +97,7 @@ Using `Play-HUMAN.cmd` (or `Play-VIctory.cmd` for CGBJ defaults):
 ```powershell
 $env:VICTORY_GAME_DIR = "D:\Games\YourDump"
 
-# Tuned Pareto residency + Ray-Traced Global Illumination (target 10+ FPS)
+# Tuned Pareto residency + Ray-Traced Global Illumination (~5 FPS average on RTX 4060)
 .\Play-HUMAN.cmd rt-gi
 
 # Fast Pareto residency with screen-space SH ambient fallback
