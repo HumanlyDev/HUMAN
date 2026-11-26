@@ -1298,6 +1298,14 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     base
 }
 
+#[cfg(windows)]
+fn normalize_placed_desc(desc: &[u32; 14]) -> [u32; 14] {
+    let mut key = *desc;
+    key[1] = 0;
+    key[13] = 0;
+    key
+}
+
 /// The bytes of title memory a placed texture with the resource description
 /// `desc` is read from for a view that starts at level `first`; `None` as
 /// [`placed_bytes`]. Remembered: asked for every slot that is looked at.
@@ -1306,12 +1314,18 @@ pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
     if first == 0 || !held_only() {
         return placed_bytes(desc);
     }
+    const KNOWN_MAX: usize = 4096;
     type Known = std::collections::HashMap<([u32; 14], u32), Option<u64>>;
     thread_local! {
         static KNOWN: std::cell::RefCell<Known> = std::cell::RefCell::default();
     }
+    let key = normalize_placed_desc(desc);
     KNOWN.with(|known| {
-        *known.borrow_mut().entry((*desc, first)).or_insert_with(|| {
+        let mut map = known.borrow_mut();
+        if let Some(&cached) = map.get(&(key, first)) {
+            return cached;
+        }
+        let value = (|| {
             let whole = placed_bytes(desc)?;
             // SAFETY: 56 bytes in the description's layout.
             let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
@@ -1320,7 +1334,12 @@ pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
             };
             let layout = &t.planes[0].layout;
             Some(layout.bytes_from(read_from(layout, first)).min(whole))
-        })
+        })();
+        if map.len() >= KNOWN_MAX {
+            map.clear();
+        }
+        map.insert((key, first), value);
+        value
     })
 }
 
@@ -3053,22 +3072,46 @@ pub(crate) extern "system" fn create_at_address(
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Compact key of `(hash(address, normalized_desc), packed_filler_words)` for
+/// [`PLACED_TWINS`] diagnostics: capped so long sessions do not leak unboundedly.
+#[cfg(all(windows, feature = "diagnostics"))]
+const PLACED_RAW_CAP: usize = 65_536;
+
 /// The placed textures asked for with filler words set, as asked
-/// (address and description): for [`PLACED_TWINS`].
-#[cfg(windows)]
-static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
+/// (`(desc_hash, filler_pair)`): for [`PLACED_TWINS`].
+#[cfg(all(windows, feature = "diagnostics"))]
+static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, u64)>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Placed textures asked for a second time with other filler words in
 /// their description: each was a second resource and host copy before the
 /// filler was left out of the key ([`texture_at`]).
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn placed_raw_key(address: u64, key: &[u32; 14], raw: &[u32; 14]) -> (u64, u64) {
+    let mut h = address ^ 0x9E37_79B9_7F4A_7C15;
+    for &word in key {
+        h = (h ^ u64::from(word)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    }
+    h ^= h >> 31;
+    let filler = (u64::from(raw[1]) << 32) | u64::from(raw[13]);
+    (h, filler)
+}
 
 /// See [`PLACED_TWINS`].
 #[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn placed_filler_twins() -> u64 {
-    PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
+    #[cfg(feature = "diagnostics")]
+    {
+        PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        0
+    }
 }
 
 /// Width, height and format of texture `this` (`None` for a buffer), for
@@ -3157,20 +3200,22 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
     // the log: `placed_filler_twins`).
+    #[cfg(feature = "diagnostics")]
     if raw != key {
+        let raw_key = placed_raw_key(address, &key, &raw);
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.insert((address, raw)) {
-            let others = seen.range((address, [0; 14])..=(address, [u32::MAX; 14])).filter(|(_, r)| {
-                let mut blank = *r;
-                blank[1] = 0;
-                blank[13] = 0;
-                blank == key
-            });
-            if others.count() > 1 {
+        if seen.len() < PLACED_RAW_CAP && seen.insert(raw_key) {
+            let others = seen
+                .range((raw_key.0, 0)..=(raw_key.0, u64::MAX))
+                .take(2)
+                .count();
+            if others > 1 {
                 PLACED_TWINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = raw;
     if let Some(&r) = map.get(&(address, *desc)) {
         return Some(r as This);
     }
@@ -4706,5 +4751,22 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn placed_desc_normalization_ignores_filler_words() {
+        let mut base = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let normalized = super::normalize_placed_desc(&base);
+        base[1] = 0xdead_beef;
+        base[13] = 0xcafe_babe;
+        assert_eq!(super::normalize_placed_desc(&base), normalized);
+        assert_eq!(normalized[1], 0);
+        assert_eq!(normalized[13], 0);
+        assert_eq!(normalized[4], 256);
+
+        if held_only() {
+            assert_eq!(placed_bytes_from(&normalized, 2), placed_bytes_from(&base, 2));
+        }
     }
 }

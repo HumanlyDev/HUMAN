@@ -432,15 +432,46 @@ thread_local! {
     static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+fn read_keep_limit(limited: bool, pressured: bool) -> usize {
+    if pressured {
+        512 << 10
+    } else if limited {
+        1 << 20
+    } else {
+        2 << 20
+    }
+}
+
+struct TrimVec<'a>(&'a mut Vec<u8>, usize);
+
+impl Drop for TrimVec<'_> {
+    fn drop(&mut self) {
+        if self.0.capacity() > self.1 {
+            *self.0 = Vec::new();
+        }
+    }
+}
+
+fn with_read_in<R>(buf: &mut Vec<u8>, size: usize, keep: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    let guard = TrimVec(buf, keep);
+    if guard.0.len() < size {
+        // Avoid 2x geometric doubling on multi-MiB textures that will be released
+        // right after the call completes.
+        if size > keep && guard.0.capacity() < size {
+            guard.0.reserve_exact(size - guard.0.len());
+        }
+        guard.0.resize(size, 0);
+    }
+    f(&mut guard.0[..size])
+}
+
 /// Calls `f` with `size` bytes of this thread's read buffer (their
 /// contents are whatever the last texture left).
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    let keep = read_keep_limit(crate::residency::limited_host_ram(), crate::residency::pressured());
     READ.with(|read| {
         let mut read = read.borrow_mut();
-        if read.len() < size {
-            read.resize(size, 0);
-        }
-        f(&mut read[..size])
+        with_read_in(&mut read, size, keep, f)
     })
 }
 
@@ -2293,5 +2324,39 @@ mod allocation_costs {
             timed("texture placed in 64 MB heaps", N, 1, &place);
             timed("texture placed in 64 MB heaps", N, 8, &place);
         }
+    }
+
+    #[test]
+    fn with_read_keeps_warm_small_buffers_and_releases_oversized() {
+        assert_eq!(super::read_keep_limit(false, false), 2 << 20);
+        assert_eq!(super::read_keep_limit(true, false), 1 << 20);
+        assert_eq!(super::read_keep_limit(false, true), 512 << 10);
+        assert_eq!(super::read_keep_limit(true, true), 512 << 10);
+
+        let keep = 4096;
+        let mut buf = Vec::new();
+
+        // Within keep: retains warm buffer capacity across calls.
+        super::with_read_in(&mut buf, 1024, keep, |slice| {
+            assert_eq!(slice.len(), 1024);
+        });
+        let warm_cap = buf.capacity();
+        assert!(warm_cap >= 1024 && warm_cap <= keep);
+
+        // Exceeds keep: uses exact capacity and frees allocation on return.
+        let oversized = keep * 4 + 123;
+        super::with_read_in(&mut buf, oversized, keep, |slice| {
+            assert_eq!(slice.len(), oversized);
+        });
+        assert_eq!(buf.capacity(), 0);
+
+        // Even if the callback unwinds, the RAII guard releases oversized buffers.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::with_read_in(&mut buf, oversized, keep, |_| {
+                panic!("simulated unwind");
+            });
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(buf.capacity(), 0);
     }
 }
