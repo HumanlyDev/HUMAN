@@ -491,6 +491,25 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
 }
 
+/// [`retire_resource`] for a batch of resources under a single lock acquisition.
+pub(crate) fn retire_resources(objects: Vec<ID3D12Resource>) {
+    if objects.is_empty() {
+        return;
+    }
+    let count = objects.len() as u64;
+    let queued = crate::queue::queued();
+    let started = STARTED.load(Ordering::Acquire) + queued;
+    if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
+        RETIREMENTS[0].fetch_add(count, Ordering::Relaxed);
+        drop(objects);
+        return;
+    }
+    RETIREMENTS[1].fetch_add(count, Ordering::Relaxed);
+    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    retired.reserve(objects.len());
+    retired.extend(objects.into_iter().map(|r| (started, Retired::Resource(r))));
+}
+
 /// How many submissions later than it could (the last one that may use it
 /// has finished) an object let go is dropped, and a host list that has run
 /// is reset, about two frames: the device losses of the night of 2026-11-25
@@ -3463,6 +3482,7 @@ fn relay_worker() {
         fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));
     };
     let mut fetch: Option<RelayFetch> = None;
+    let mut fences: Vec<Option<u64>> = Vec::new();
     loop {
         let next = {
             let mut line = line();
@@ -3471,14 +3491,11 @@ fn relay_worker() {
                     line = RELAY_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
                     continue;
                 }
-                let fences: Vec<Option<u64>> = line
-                    .line
-                    .iter()
-                    .map(|l| match l {
-                        Late::Run(flight) => Some(flight.fence),
-                        _ => None,
-                    })
-                    .collect();
+                fences.clear();
+                fences.extend(line.line.iter().map(|l| match l {
+                    Late::Run(flight) => Some(flight.fence),
+                    _ => None,
+                }));
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
                 let n = landable(&fences, completed);
