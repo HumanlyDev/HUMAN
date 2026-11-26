@@ -75,8 +75,8 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "bcpack-gpu-sdk"
-version = "0.13.0"
-source = "git+https://github.com/POMXARK/bcpack-gpu-sdk.git?tag=v0.13.0#7b79cbd11cdc33d363d9d186b2fad03a3d1e3987"
+version = "0.14.1"
+source = "git+https://github.com/POMXARK/bcpack-gpu-sdk.git?tag=v0.14.1#727a214b5d68a23dc5e1df7f5efd00089ab42d39"
 dependencies = [
  "bcpack-rs",
  "windows 0.58.0",
@@ -85,7 +85,7 @@ dependencies = [
 [[package]]
 name = "bcpack-rs"
 version = "0.2.0"
-source = "git+https://github.com/Ahmet-Dedeler/bcpack-rs?rev=f5145dda7fa6d1a22b499d82f3e63029713b71b6#f5145dda7fa6d1a22b499d82f3e63029713b71b6"
+source = "git+https://github.com/Ahmet-Dedeler/bcpack-rs?rev=7b2b42122c6b05787506f212e9a2570999d3f143#7b2b42122c6b05787506f212e9a2570999d3f143"
 dependencies = [
  "serde_json",
 ]
