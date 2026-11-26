@@ -392,6 +392,9 @@ pub(crate) struct HostPipeline {
     /// (`victory_shader::emit::rect_list_gs`): its rectangle draws go out
     /// as the title gives them, three vertices a rectangle.
     pub(crate) rects: bool,
+    /// Precomputed check for whether any stage's shader hash is in
+    /// `BAKE_PIXEL_SHADERS` or `BAKE_GEOMETRY_SHADERS`.
+    pub(crate) is_bake_shader: bool,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
     /// Its depth, stencil, cull and blend state in short, for the frame
@@ -633,6 +636,10 @@ impl HostPipeline {
             };
             tracing::info!(?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
+            let is_bake_shader = bound.iter().any(|s| {
+                let h = s.shader.hash.as_str();
+                crate::draw::BAKE_PIXEL_SHADERS.contains(&h) || crate::draw::BAKE_GEOMETRY_SHADERS.contains(&h)
+            });
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
@@ -643,6 +650,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 rects: false,
+                is_bake_shader,
                 state: String::new(),
             });
         }
@@ -686,6 +694,10 @@ impl HostPipeline {
             };
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
+            let is_bake_shader = bound.iter().any(|s| {
+                let h = s.shader.hash.as_str();
+                crate::draw::BAKE_PIXEL_SHADERS.contains(&h) || crate::draw::BAKE_GEOMETRY_SHADERS.contains(&h)
+            });
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
@@ -696,6 +708,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 rects: false,
+                is_bake_shader,
                 state: String::new(),
             });
         }
@@ -802,6 +815,10 @@ impl HostPipeline {
             cull = g.rasterizer.CullMode.0,
             "host graphics state"
         );
+        let is_bake_shader = bound.iter().any(|s| {
+            let h = s.shader.hash.as_str();
+            crate::draw::BAKE_PIXEL_SHADERS.contains(&h) || crate::draw::BAKE_GEOMETRY_SHADERS.contains(&h)
+        });
         Some(HostPipeline {
             compute: false,
             mesh: false,
@@ -812,6 +829,7 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
             rects: rect_gs.is_some(),
+            is_bake_shader,
             state: {
                 let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {

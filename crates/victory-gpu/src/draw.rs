@@ -255,7 +255,7 @@ pub(crate) const BAKE_PIXEL_SHADERS: [&str; 7] = [
 /// permutation (`vertex 089d6271be6650ef` fullscreen-triangle ped baker and
 /// `mesh d4111a6e6ea49d91` decoration projection mesh), catching pixel-shader
 /// permutations beyond `BAKE_PIXEL_SHADERS`.
-const BAKE_GEOMETRY_SHADERS: [&str; 2] = ["089d6271be6650ef", "d4111a6e6ea49d91"];
+pub(crate) const BAKE_GEOMETRY_SHADERS: [&str; 2] = ["089d6271be6650ef", "d4111a6e6ea49d91"];
 
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
@@ -466,9 +466,13 @@ pub(crate) struct State {
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// Reusable scratch buffers for `State::tables()` to avoid per-draw allocations.
+    selected_scratch: Vec<u32>,
+    listed_words: Vec<Option<[u32; 3]>>,
+    listed_out: Vec<Option<crate::descriptor::host::Listed>>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
@@ -1600,18 +1604,21 @@ impl State {
             if sampler_heap.is_none() {
                 sampler_heap = crate::host::host().and_then(|h| h.fallback_sampler_heap().cloned());
             }
-            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
+            let mut heaps: [Option<ID3D12DescriptorHeap>; 2] = [None, None];
+            let mut heap_count = 0;
             if let Some(h) = view_heap {
                 list.keep(&h);
-                heaps.push(Some(h));
+                heaps[heap_count] = Some(h);
+                heap_count += 1;
             }
             if let Some(h) = sampler_heap {
                 list.keep(&h);
-                heaps.push(Some(h));
+                heaps[heap_count] = Some(h);
+                heap_count += 1;
             }
-            if !heaps.is_empty() {
+            if heap_count > 0 {
                 // SAFETY: an open list and shader-visible heaps.
-                unsafe { l.SetDescriptorHeaps(&heaps) };
+                unsafe { l.SetDescriptorHeaps(&heaps[..heap_count]) };
             }
             self.host_heaps = self.heaps;
             self.host_heaps_set = true;
@@ -2277,10 +2284,7 @@ impl State {
     /// (`>= 512x512`) so unseen NPC/head/clothing shader permutations never
     /// bake `neutral()` or `null` stand-ins into permanent ped textures.
     fn is_bake_draw(&self, p: &HostPipeline) -> bool {
-        if p.stages.iter().any(|s| {
-            let h = s.shader.hash.as_str();
-            BAKE_PIXEL_SHADERS.contains(&h) || BAKE_GEOMETRY_SHADERS.contains(&h)
-        }) {
+        if p.is_bake_shader {
             return true;
         }
         self.depth == 0
@@ -3701,20 +3705,18 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = group
-                .indexed
-                .iter()
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
+            let mut selected = std::mem::take(&mut self.selected_scratch);
+            selected.clear();
+            selected.extend(group.indexed.iter().map(|index| {
+                let constant = self.user_value(
+                    compute,
+                    index.constant_slot,
+                    RootType::Constants,
+                    index.constant_dword,
+                );
+                // The shader adds i32 byte offsets and shifts by 5.
+                index.byte_offset.wrapping_add(constant << index.shift) / 32
+            }));
             selected.sort_unstable();
             selected.dedup();
             let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
@@ -3723,6 +3725,7 @@ impl State {
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
+                self.selected_scratch = selected;
                 continue;
             }
             // The table and what its entries hold (record words).
@@ -3760,7 +3763,7 @@ impl State {
                         readable(list, u.kind, &view);
                     }
                 }
-                for k in selected {
+                for &k in &selected {
                     if group.entry(k).is_some() {
                         continue;
                     }
@@ -3786,6 +3789,7 @@ impl State {
                     }
                 }
                 made.push((slot, first * 32));
+                self.selected_scratch = selected;
                 continue;
             }
             let Some(first) = host.dynamic(n).or_else(|| {
@@ -3795,6 +3799,7 @@ impl State {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
+                self.selected_scratch = selected;
                 continue;
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
@@ -3817,6 +3822,14 @@ impl State {
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
             }
             let recording = self.recording;
+            let mut listed_words = std::mem::take(&mut self.listed_words);
+            let mut listed_out = std::mem::take(&mut self.listed_out);
+            if list_views {
+                listed_words.clear();
+                listed_words.extend((0..n).map(|k| crate::descriptor::record_at(table + u64::from(k) * 32)));
+                listed_out.resize(n as usize, None);
+                host.make_listed_batch(recording, first, &listed_words, &mut listed_out);
+            }
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3824,8 +3837,8 @@ impl State {
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
                 if list_views
-                    && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
-                    && let Some(mut listed) = host.make_listed(recording, words, index)
+                    && let Some(words) = listed_words[k as usize]
+                    && let Some(mut listed) = listed_out[k as usize]
                 {
                     let kind = group
                         .entry(k)
@@ -3905,6 +3918,9 @@ impl State {
                     }
                 }
             }
+            self.selected_scratch = selected;
+            self.listed_words = listed_words;
+            self.listed_out = listed_out;
             made.push((slot, first * 32));
         }
         made

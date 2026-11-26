@@ -158,8 +158,8 @@ pub(crate) struct HostHeap {
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
     /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// (by lists not yet reset), packed 64 slots per `u64` word.
+    next: Mutex<DynamicSlots>,
     /// How many dynamic slots are free (changed under `next`'s lock): with
     /// fewer than a table needs, the search is not made. Once the world
     /// had taken them all, every later table of the frame searched every
@@ -1611,7 +1611,7 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new(DynamicSlots::new(extra)),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
@@ -1715,6 +1715,90 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+struct DynamicSlots {
+    cursor: u32,
+    len: u32,
+    words: Vec<u64>,
+}
+
+impl DynamicSlots {
+    fn new(len: u32) -> Self {
+        Self {
+            cursor: 0,
+            len,
+            words: vec![0; len.div_ceil(64) as usize],
+        }
+    }
+
+    fn scan_range(&self, from: u32, to: u32, n: u32) -> Option<u32> {
+        let mut at = from;
+        let mut run = 0u32;
+        while at < to {
+            let wi = (at / 64) as usize;
+            let bi = at % 64;
+            let avail = (64 - bi).min(to - at);
+            let w = self.words[wi] >> bi;
+            if bi == 0 && avail == 64 && w == !0u64 {
+                run = 0;
+                at += 64;
+                continue;
+            }
+            let free_prefix = w.trailing_zeros().min(avail);
+            run += free_prefix;
+            if run >= n {
+                return Some(at + free_prefix - run);
+            }
+            at += free_prefix;
+            if free_prefix == avail {
+                continue;
+            }
+            run = 0;
+            let rem = to - at;
+            let w2 = self.words[wi] >> (at % 64);
+            at += w2.trailing_ones().min(rem);
+        }
+        None
+    }
+
+    fn alloc(&mut self, n: u32) -> Option<u32> {
+        if n == 0 || n > self.len {
+            return None;
+        }
+        let second_end = self.cursor.saturating_add(n - 1).min(self.len);
+        let first = self
+            .scan_range(self.cursor, self.len, n)
+            .or_else(|| self.scan_range(0, second_end, n))?;
+        let mut at = first;
+        let end = first + n;
+        while at < end {
+            let wi = (at / 64) as usize;
+            let bi = at % 64;
+            let k = (64 - bi).min(end - at);
+            let mask = if k == 64 { !0u64 } else { ((1u64 << k) - 1) << bi };
+            self.words[wi] |= mask;
+            at += k;
+        }
+        self.cursor = end % self.len;
+        Some(first)
+    }
+
+    fn free_range(&mut self, at: u32, end: u32) -> u32 {
+        let mut cur = at.min(self.len);
+        let end = end.min(self.len);
+        let mut given = 0u32;
+        while cur < end {
+            let wi = (cur / 64) as usize;
+            let bi = cur % 64;
+            let k = (64 - bi).min(end - cur);
+            let mask = if k == 64 { !0u64 } else { ((1u64 << k) - 1) << bi };
+            given += (self.words[wi] & mask).count_ones();
+            self.words[wi] &= !mask;
+            cur += k;
+        }
+        given
+    }
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -1727,34 +1811,12 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
-        let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
-        let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = if enough { guard.alloc(n) } else { None };
         let Some(first) = found else {
             if enough {
-                self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
+                self.too_long.fetch_min(n, std::sync::atomic::Ordering::Relaxed);
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
@@ -1768,10 +1830,8 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % end) as u32;
-        Some(self.count + first as u32)
+        self.free.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+        Some(self.count + first)
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -2781,19 +2841,20 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let end = (at + n).min(self.dynamic) as usize;
+        let end = (at + n).min(self.dynamic);
         // Release COM references pinned in dynamic slots before marking the
         // slots reusable so dead textures/buffers are not held in VRAM until
         // those exact indices are overwritten.
-        for slot in at as usize..end {
-            self.keep(self.count + slot as u32, None);
+        let mut retired = Vec::new();
+        for slot in at..end {
+            self.keep_into(self.count + slot, None, &mut retired);
         }
+        crate::host::retire_resources(retired);
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
+        let given = guard.free_range(at, end);
+        if given > 0 {
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
         }
     }
 
@@ -2808,6 +2869,124 @@ impl HostHeap {
         self.twin_made(index, kept.is_some() && twinned(view));
         self.write_stride(index, if kept.is_some() { view_stride_word(view) } else { 0 });
         self.keep(index, kept.flatten());
+    }
+
+    /// Like [`HostHeap::make_listed`], but processes an entire table's slice
+    /// of descriptor records in one `LIST_VIEWS` borrow, one batched
+    /// `CopyDescriptors` call per heap type, and one batched `retire_resources`.
+    pub(crate) fn make_listed_batch(
+        &self,
+        recording: u64,
+        first: u32,
+        words: &[Option<[u32; 3]>],
+        out: &mut [Option<Listed>],
+    ) {
+        out.fill(None);
+        if self.sampler || words.is_empty() {
+            return;
+        }
+        let Some(host) = host() else { return };
+        let mut retired = Vec::new();
+        LIST_VIEWS.with(|views| {
+            let mut views = views.borrow_mut();
+            if views.is_none() {
+                *views = Some(ListViews::new()?);
+            }
+            let views = views.as_mut()?;
+            if views.recording != recording {
+                views.recording = recording;
+                views.made.clear();
+            }
+            COPY_BATCH.with(|batch| {
+                let mut batch = batch.borrow_mut();
+                batch.clear();
+                let has_twins = !self.twins.is_empty();
+                #[cfg(feature = "diagnostics")]
+                let coarse = crate::host::coarse_ms() as u32;
+                for (k, maybe_words) in words.iter().enumerate() {
+                    let Some(w) = *maybe_words else {
+                        continue;
+                    };
+                    let index = first + k as u32;
+                    let twins = has_twins && (index as usize) < self.twins.len();
+                    if !views.made.contains_key(&w) {
+                        let Some(view) = super::view_at(w[1], w[2]) else {
+                            continue;
+                        };
+                        let at = 2 * views.made.len() as u32;
+                        if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
+                            continue;
+                        }
+                        let twin = twinned(&view);
+                        let Some(kept) = make_twinned(&view, views.slot(at), Some(views.slot(at + 1))) else {
+                            continue;
+                        };
+                        let stride_word = view_stride_word(&view);
+                        let listed = Listed {
+                            kind: crate::draw::view_kind(&view),
+                            texture: is_texture_view(&view),
+                            ready: (0, 0, false),
+                            tabled: None,
+                        };
+                        views.made.insert(w, ListView { view, at, twin, stride_word, kept, listed });
+                    }
+                    let made = &views.made[&w];
+                    batch.dst_primary.push(self.cpu(index));
+                    batch.src_primary.push(views.slot(made.at));
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(written) = self.written.get(index as usize) {
+                        written.store(coarse, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if made.twin && twins {
+                        let twin_idx = self.raw + index;
+                        batch.dst_twin.push(self.cpu(twin_idx));
+                        batch.src_twin.push(views.slot(made.at + 1));
+                        #[cfg(feature = "diagnostics")]
+                        if let Some(written) = self.written.get(twin_idx as usize) {
+                            written.store(coarse, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        self.clear_twin(index);
+                    }
+                    self.write_stride(index, made.stride_word);
+                    self.keep_into(index, made.kept.clone(), &mut retired);
+                    out[k] = Some(made.listed);
+                }
+                if !batch.dst_primary.is_empty() {
+                    let n = batch.dst_primary.len() as u32;
+                    // SAFETY: all handles point to live slots in our heaps; null sizes mean 1 per range.
+                    unsafe {
+                        host.device.CopyDescriptors(
+                            n,
+                            batch.dst_primary.as_ptr(),
+                            None,
+                            n,
+                            batch.src_primary.as_ptr(),
+                            None,
+                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        );
+                    }
+                }
+                if !batch.dst_twin.is_empty() {
+                    let n = batch.dst_twin.len() as u32;
+                    // SAFETY: all handles point to live twin slots in our heaps; null sizes mean 1 per range.
+                    unsafe {
+                        host.device.CopyDescriptors(
+                            n,
+                            batch.dst_twin.as_ptr(),
+                            None,
+                            n,
+                            batch.src_twin.as_ptr(),
+                            None,
+                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        );
+                    }
+                }
+            });
+            Some(())
+        });
+        crate::host::retire_resources(retired);
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
@@ -2936,6 +3115,12 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        let mut retired = Vec::new();
+        self.keep_into(index, resource, &mut retired);
+        crate::host::retire_resources(retired);
+    }
+
+    fn keep_into(&self, index: u32, resource: Option<ID3D12Resource>, retired: &mut Vec<ID3D12Resource>) {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
@@ -2951,7 +3136,7 @@ impl HostHeap {
         // A running submission may still read the old resource through
         // this slot.
         if let Some(old) = old {
-            crate::host::retire_resource(old);
+            retired.push(old);
         }
     }
 
@@ -5809,6 +5994,27 @@ mod tests {
         assert!(heap.make_listed(0x1234, rec, s0 + 3).is_some());
         assert_eq!(read_stride(s0 + 3), 8 | VIEW_INTEGER);
     }
+
+    #[test]
+    fn dynamic_slots_bitset_handles_boundaries_wrap_and_free() {
+        let mut ds = super::DynamicSlots::new(200);
+        // Single and multi-slot allocations across 64-bit word boundary
+        let a = ds.alloc(60).unwrap();
+        assert_eq!(a, 0);
+        let b = ds.alloc(10).unwrap();
+        assert_eq!(b, 60); // spans word 0 -> word 1 (60..70)
+        // Free first 60, allocate 130 (fits in 70..200)
+        assert_eq!(ds.free_range(0, 60), 60);
+        let c = ds.alloc(130).unwrap();
+        assert_eq!(c, 70);
+        // Cursor is at 200 % 200 == 0; 0..60 is free, 60..200 is taken
+        assert_eq!(ds.alloc(61), None);
+        assert_eq!(ds.alloc(60), Some(0));
+        // Free 60..70, verify exact freed count even if called twice
+        assert_eq!(ds.free_range(60, 70), 10);
+        assert_eq!(ds.free_range(60, 70), 0);
+        assert_eq!(ds.alloc(10), Some(60));
+    }
 }
 
 /// What is known of a record a list's tables hold, in that recording of the
@@ -5879,8 +6085,31 @@ impl ListViews {
     }
 }
 
+#[derive(Default)]
+struct CopyBatch {
+    dst_primary: Vec<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    src_primary: Vec<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    dst_twin: Vec<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    src_twin: Vec<D3D12_CPU_DESCRIPTOR_HANDLE>,
+}
+
+impl CopyBatch {
+    fn clear(&mut self) {
+        self.dst_primary.clear();
+        self.src_primary.clear();
+        self.dst_twin.clear();
+        self.src_twin.clear();
+    }
+}
+
 thread_local! {
     static LIST_VIEWS: std::cell::RefCell<Option<ListViews>> = const { std::cell::RefCell::new(None) };
+    static COPY_BATCH: std::cell::RefCell<CopyBatch> = const { std::cell::RefCell::new(CopyBatch {
+        dst_primary: Vec::new(),
+        src_primary: Vec::new(),
+        dst_twin: Vec::new(),
+        src_twin: Vec::new(),
+    }) };
 }
 
 /// The view the record `words` names, as this thread made it for `recording`.

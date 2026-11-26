@@ -1005,6 +1005,15 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is detected; slices are valid for their lengths.
+        return unsafe { merge_piece_avx2(now, held, title) };
+    }
+    merge_piece_scalar(now, held, title)
+}
+
+fn merge_piece_scalar(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     let mut differs = 0u8;
     for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
@@ -1014,6 +1023,39 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
         *h = (*h & !wrote) | (*n & wrote);
     }
     differs != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_piece_avx2(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm256_blendv_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
+        _mm256_or_si256, _mm256_setzero_si256, _mm256_storeu_si256, _mm256_testz_si256,
+        _mm256_xor_si256,
+    };
+    let len = now.len().min(held.len()).min(title.len());
+    let mut diff_acc = _mm256_setzero_si256();
+    let mut i = 0;
+    while i + 32 <= len {
+        // SAFETY: `i + 32 <= len` so all three pointers are valid for 32-byte unaligned access.
+        unsafe {
+            let n = _mm256_loadu_si256(now.as_ptr().add(i).cast::<__m256i>());
+            let h = _mm256_loadu_si256(held.as_ptr().add(i).cast::<__m256i>());
+            let eq = _mm256_cmpeq_epi8(n, h);
+            if _mm256_movemask_epi8(eq) != -1 {
+                let t_ptr = title.as_mut_ptr().add(i).cast::<__m256i>();
+                let t = _mm256_loadu_si256(t_ptr);
+                let merged = _mm256_blendv_epi8(n, t, eq);
+                diff_acc = _mm256_or_si256(diff_acc, _mm256_xor_si256(merged, t));
+                _mm256_storeu_si256(t_ptr, merged);
+                _mm256_storeu_si256(held.as_mut_ptr().add(i).cast::<__m256i>(), n);
+            }
+        }
+        i += 32;
+    }
+    let simd_differs = _mm256_testz_si256(diff_acc, diff_acc) == 0;
+    let tail_differs = merge_piece_scalar(&now[i..len], &mut held[i..len], &mut title[i..len]);
+    simd_differs || tail_differs
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -1980,6 +2022,15 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is detected; slices are valid for their lengths.
+        return unsafe { changed_runs_avx2(now, was) };
+    }
+    changed_runs_scalar(now, was)
+}
+
+fn changed_runs_scalar(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -2003,6 +2054,67 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
             i += 1;
         }
         runs.push((first, i - first));
+    }
+    runs
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    let n = now.len().min(was.len());
+    let mut runs = Vec::new();
+    let mut run_start: Option<usize> = None;
+    let mut i = 0;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` so both slices are valid for 32-byte unaligned loads.
+        let diff = unsafe {
+            let a = _mm256_loadu_si256(now.as_ptr().add(i).cast::<__m256i>());
+            let b = _mm256_loadu_si256(was.as_ptr().add(i).cast::<__m256i>());
+            !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) as u32)
+        };
+        if diff == 0 {
+            if let Some(start) = run_start.take() {
+                runs.push((start, i - start));
+            }
+        } else if diff == u32::MAX {
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+        } else {
+            let mut bit = 0u32;
+            while bit < 32 {
+                let rem = diff >> bit;
+                if let Some(start) = run_start {
+                    let ones = rem.trailing_ones().min(32 - bit);
+                    bit += ones;
+                    if bit < 32 {
+                        runs.push((start, i + bit as usize - start));
+                        run_start = None;
+                    }
+                } else {
+                    let zeros = rem.trailing_zeros().min(32 - bit);
+                    bit += zeros;
+                    if bit < 32 {
+                        run_start = Some(i + bit as usize);
+                    }
+                }
+            }
+        }
+        i += 32;
+    }
+    while i < n {
+        if now[i] != was[i] {
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+        } else if let Some(start) = run_start.take() {
+            runs.push((start, i - start));
+        }
+        i += 1;
+    }
+    if let Some(start) = run_start {
+        runs.push((start, n - start));
     }
     runs
 }
@@ -2472,6 +2584,37 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn avx2_changed_runs_and_merge_piece_match_scalar() {
+        for len in [0usize, 1, 31, 32, 33, 63, 64, 65, 127, 128, 257] {
+            let base: Vec<u8> = (0..len).map(|i| (i * 13 + 7) as u8).collect();
+            let mut now = base.clone();
+            let mut title_scalar = base.clone();
+            let mut title_simd = base.clone();
+            let mut held_scalar = base.clone();
+            let mut held_simd = base.clone();
+            for i in 0..len {
+                if i % 5 == 0 || (30..=35).contains(&i) || (62..=66).contains(&i) {
+                    now[i] ^= 0x5a;
+                }
+                if i % 7 == 0 {
+                    title_scalar[i] = 0xee;
+                    title_simd[i] = 0xee;
+                }
+            }
+            assert_eq!(
+                super::changed_runs(&now, &base),
+                super::changed_runs_scalar(&now, &base),
+                "changed_runs mismatch at len={len}"
+            );
+            let r_scalar = super::merge_piece_scalar(&now, &mut held_scalar, &mut title_scalar);
+            let r_simd = super::merge_piece(&now, &mut held_simd, &mut title_simd);
+            assert_eq!(r_simd, r_scalar, "merge_piece return mismatch at len={len}");
+            assert_eq!(held_simd, held_scalar, "held mismatch at len={len}");
+            assert_eq!(title_simd, title_scalar, "title mismatch at len={len}");
+        }
     }
 }
 
