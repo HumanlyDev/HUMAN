@@ -181,17 +181,8 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     let began = std::time::Instant::now();
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
-    let timed_out = || limit.is_some_and(|n| began.elapsed().as_secs() >= n);
-    let all_found = || !all && lock(&done).len() >= wanted.len();
-    'walk: for root in &paths {
+    for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
-            if timed_out() {
-                counts[3].fetch_add(1, Ordering::Relaxed);
-                break 'walk;
-            }
-            if all_found() {
-                break 'walk;
-            }
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
@@ -204,17 +195,14 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                 for _ in 0..threads.min(jobs.len()) {
                     s.spawn(|| {
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            if timed_out() {
-                                counts[3].fetch_add(1, Ordering::Relaxed);
-                                break;
-                            }
-                            if all_found() {
-                                break;
-                            }
                             let Some(bytes) = job.bytes() else {
                                 continue;
                             };
                             let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+                            if limit.is_some_and(|n| began.elapsed().as_secs() >= n) {
+                                counts[3].fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
                             if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash) {
                                 continue;
                             }
@@ -252,12 +240,18 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
+    // Dumped shaders and validator reports are game-derived (rule #1).
+    if let Some(dir) = std::env::var_os("VICTORY_EMIT_DUMP") {
+        victory_core::ensure_outside_repo(Path::new(&dir))?;
+    }
     let paths = crate::default_paths(paths)?;
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
     if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
         victory_shader::emit::set_host_max_wave(n);
     }
+    // `VICTORY_HOST_RDNA=1`: as for an AMD RDNA card (`VICTORY_RDNA_FLOAT`).
+    victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").is_some_and(|v| v == "1"));
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
@@ -296,29 +290,25 @@ pub fn run(
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
-                    // Pipeline creation converts DXIL on this thread.
-                    std::thread::Builder::new()
-                        .stack_size(victory_shader::emit::PIPELINE_STACK)
-                        .spawn_scoped(s, || {
-                            let mut t = Tally {
-                                list,
-                                ..Tally::default()
-                            };
-                            let mut checks = Checks {
-                                keep: (!pairs.is_empty()).then(|| kept.clone()),
-                                validator: validate
-                                    .then(|| Validator::load(dll.as_deref()).ok())
-                                    .flatten(),
-                                host: pipelines
-                                    .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                    .flatten(),
-                            };
-                            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                                translate(job, entry.path(), &seen, &mut t, &mut checks);
-                            }
-                            lock(&total).merge(t);
-                        })
-                        .expect("a translation worker");
+                    s.spawn(|| {
+                        let mut t = Tally {
+                            list,
+                            ..Tally::default()
+                        };
+                        let mut checks = Checks {
+                            keep: (!pairs.is_empty()).then(|| kept.clone()),
+                            validator: validate
+                                .then(|| Validator::load(dll.as_deref()).ok())
+                                .flatten(),
+                            host: pipelines
+                                .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
+                                .flatten(),
+                        };
+                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            translate(job, entry.path(), &seen, &mut t, &mut checks);
+                        }
+                        lock(&total).merge(t);
+                    });
                 }
             });
         }
@@ -403,17 +393,71 @@ pub fn run(
     Ok(())
 }
 
-#[derive(PartialEq, Eq, Hash)]
-struct ShaderKey {
-    dxil: blake3::Hash,
-    /// Input, output and primitive signatures, followed by pipeline validation info.
-    interface: [Option<blake3::Hash>; 4],
+/// Every shader found into the cache runs translate from.
+pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
+    let cfg = victory_core::Config::load()?;
+    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let paths = crate::default_paths(paths)?;
+    let threads =
+        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let started = std::time::Instant::now();
+    let seen = Mutex::new(HashSet::new());
+    let done = AtomicUsize::new(0);
+    let failed = Mutex::new(BTreeMap::<String, (usize, String)>::new());
+    for root in &paths {
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                continue;
+            }
+            let Ok(data) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let jobs = sources(&data);
+            let next = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..threads.min(jobs.len()) {
+                    s.spawn(|| {
+                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let Some(bytes) = job.bytes() else { continue };
+                            let hash = blake3::hash(&bytes);
+                            if !lock(&seen).insert(hash) {
+                                continue;
+                            }
+                            match victory_hle::modules::d3d12x::precompile(&bytes) {
+                                Ok(_) => {
+                                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if n.is_multiple_of(1000) {
+                                        println!("{n} shaders in the cache, {:.0} s", started.elapsed().as_secs_f64());
+                                    }
+                                }
+                                Err(why) => {
+                                    let mut failed = lock(&failed);
+                                    failed.entry(why).or_insert_with(|| (0, hash.to_hex()[..16].to_owned())).0 += 1;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        }
+    }
+    let failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "{} shaders in the cache, {} do not translate, {:.0} s",
+        done.load(Ordering::Relaxed),
+        failed.values().map(|f| f.0).sum::<usize>(),
+        started.elapsed().as_secs_f64()
+    );
+    for (why, (n, hash)) in failed {
+        println!("  {n:>5}  {why}  (e.g. {hash})");
+    }
+    Ok(())
 }
 
 fn translate(
     source: &Source,
     path: &Path,
-    seen: &Mutex<HashSet<ShaderKey>>,
+    seen: &Mutex<HashSet<blake3::Hash>>,
     t: &mut Tally,
     checks: &mut Checks,
 ) {
@@ -443,10 +487,11 @@ fn translate(
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
+    let Some(dxil) = container.part(FourCC::DXIL).or(container.part(FourCC::ACCC)).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    // `~`: the hash of the DXIL part alone, for comparing diagnostic lines.
+    // `~`: the hash of the code alone; containers that differ only around
+    // it are translated once, the others listed as duplicates of it.
     let code = blake3::hash(dxil);
     let code8 = code.to_hex()[..8].to_owned();
     let example = || format!("{} ~{code8}", example());
@@ -468,13 +513,7 @@ fn translate(
             let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
         }
     }
-    // Emission also consumes the signatures and pipeline validation info.
-    let interface = [FourCC::ISG1, FourCC::OSG1, FourCC::PSG1, FourCC::PSV0]
-        .map(|kind| container.part(kind).map(|part| blake3::hash(part.data)));
-    if !lock(seen).insert(ShaderKey {
-        dxil: code,
-        interface,
-    }) {
+    if !lock(seen).insert(code) {
         t.duplicates += 1;
         if t.list {
             t.lines.push(format!("{}  duplicate", example()));
@@ -576,10 +615,6 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                             .fail(format!("emit: {what}"), || {
                                 format!("{} at {offset:#x}", label())
                             }),
-                        Err(ShaderError::UnsupportedHardwareSgprInput { offset, sgpr }) => t
-                            .fail(format!("emit: {}", ShaderError::HARDWARE_SGPR_INPUT), || {
-                                format!("{} at {offset:#x} (s{sgpr})", label())
-                            }),
                         Err(e) => t.fail(format!("emit: {e}"), label),
                     }
                 }
@@ -650,6 +685,12 @@ fn check(
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
     }
+    // With `--list`: a hash of the module and of what the host binds for it,
+    // to show which shaders a change to the translator touches.
+    if t.list {
+        let hash = blake3::hash(format!("{shader:?}").as_bytes()).to_hex();
+        t.lines.push(format!("{}  emitted {}", label(), &hash[..16]));
+    }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list
         && let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP")
@@ -681,6 +722,9 @@ fn check(
         }
     }
     let Some(v) = checks.validator.as_mut() else {
+        if t.list && checks.host.is_none() {
+            t.lines.push(format!("{}  emitted", label()));
+        }
         return;
     };
     match v.validate(&mut shader.dxil) {
@@ -899,41 +943,21 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
+    /// Shader dumps are game-derived, so a dump directory in the repo is refused.
     #[test]
-    fn shared_dxil_with_distinct_signatures_is_not_a_duplicate() {
-        let make = |signature: u32| {
-            let fourcc = u32::from_le_bytes;
-            let words = [
-                fourcc(*b"DXBC"), 0, 0, 0, 0, // Magic and digest.
-                1, 64, 2, 40, 52, // Version, size, and the two part offsets.
-                fourcc(*b"DXIL"), 4, 0,
-                fourcc(*b"OSG1"), 4, signature,
-            ];
-            words
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect::<Vec<_>>()
-        };
-        let first = make(1);
-        let second = make(2);
-        let seen = Mutex::new(HashSet::new());
-        let mut tally = Tally::default();
-        let mut checks = Checks {
-            keep: None,
-            validator: None,
-            host: None,
-        };
-
-        // The shared synthetic DXIL body is intentionally invalid. Deduplication
-        // happens before decoding it, so only the repeat should be skipped.
-        for data in [&first[..], &second, &first] {
-            let source = Source::Raw { offset: 0, data };
-            translate(&source, Path::new("test.dxbc"), &seen, &mut tally, &mut checks);
-        }
-
-        assert_eq!(tally.containers, 3);
-        assert_eq!(tally.duplicates, 1);
+    fn emit_dump_inside_repo_is_refused() {
+        // SAFETY: no other test in this binary touches the environment.
+        unsafe { std::env::set_var("VICTORY_EMIT_DUMP", env!("CARGO_MANIFEST_DIR")) };
+        let missing = std::env::temp_dir().join("victory-translate-no-such-dir");
+        let err = super::run(vec![missing], false, false, false, Some(1)).unwrap_err();
+        // SAFETY: as above; unset so a later test's `run` is not refused.
+        unsafe { std::env::remove_var("VICTORY_EMIT_DUMP") };
+        assert!(
+            matches!(
+                err.downcast_ref(),
+                Some(victory_core::PolicyError::InsideRepo { .. })
+            ),
+            "{err}"
+        );
     }
 }

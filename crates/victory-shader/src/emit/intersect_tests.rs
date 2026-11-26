@@ -162,13 +162,19 @@ fn build(
     wide: bool,
     descriptor: Descriptor,
 ) -> Result<(HostShader, resource::Resources), ShaderError> {
-    let native = native(&program(wide, descriptor));
+    build_compute_shader(&native(&program(wide, descriptor)))
+}
+
+/// `native`, a compute program, translated (the tests' own way: no container).
+pub(super) fn build_compute_shader(
+    native: &NativeProgram,
+) -> Result<(HostShader, resource::Resources), ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -295,23 +301,12 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
     let ids2 = [8, bvh::NONE, 24, 0x1fff_fffc];
     box_nodes.push((s.add(nodes::box32(ids2, around), 32), 5));
     box_nodes.push((s.add(nodes::box16(ids2, around), 16), 4));
-    // Partial-axis NaN and inverted/empty boxes alongside a zero-thickness box.
-    let degenerate = [
-        [
-            f32::INFINITY,
-            f32::INFINITY,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
-        ],
-        [-1.0, f32::NAN, -1.0, 1.0, 1.0, 1.0],
-        [-1.0, 1.0, -1.0, 1.0, -1.0, 1.0],
-        [0.0, -1.0, -1.0, 0.0, 1.0, 1.0],
-    ];
-    let ids3 = [0x40, 0x48, 0x50, 0x58];
-    box_nodes.push((s.add(nodes::box32(ids3, degenerate), 32), 5));
-    box_nodes.push((s.add(nodes::box16(ids3, degenerate), 16), 4));
+    // A child that is not there with inverted infinite bounds (the title's
+    // builder leaves such slots): every ray "enters" it at minus infinity.
+    let mut empty = lined;
+    empty[1] = [f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+    let ids3 = [0x105, bvh::NONE, 0x304, 0x400];
+    box_nodes.push((s.add(nodes::box32(ids3, empty), 32), 5));
     // Random boxes.
     for n in 0..6 {
         let boxes: [[f32; 6]; 4] = std::array::from_fn(|_| {
@@ -386,7 +381,7 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
             let origin = g.vector(12.0);
             let direction = if k % 2 == 0 {
                 let b = boxes[(k / 2) % 4];
-                if !(b[0] <= b[3] && b[1] <= b[4] && b[2] <= b[5]) {
+                if b[0].is_nan() {
                     g.vector(1.0)
                 } else {
                     std::array::from_fn(|a| (b[a] + b[3 + a]) / 2.0 - origin[a] + g.unit() / 2.0)
@@ -706,160 +701,59 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
     }
 }
 
-/// Lowers `program(wide, WHOLE)` through the real `SLOT_MEMORY` directory and
-/// returns the validated shader plus its post-optimisation memory IR stats.
-fn build_directory(wide: bool) -> (HostShader, super::bitcode::MemoryIrStats) {
-    let native = native(&program(wide, WHOLE));
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("tracked");
-    let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-    })
-    .expect("directory program lowers");
-    let stats = lowered.memory_ir;
-    let shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-        root_uavs: lowered.root_uavs,
-        root_indexed_views: res.root_indexed_views,
-    };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        let mut copy = shader.dxil.clone();
-        v.validate(&mut copy).expect("DXIL validation failed");
-    }
-    (shader, stats)
-}
-
 #[test]
-fn the_directory_fault_store_is_guarded_and_non_straddling_box32_skips_second_lookup() {
-    for wide in [true, false] {
-        let (shader, stats) = build_directory(wide);
-        assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
-        assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
-        assert_eq!(stats.fault_stores_total, 2, "wide={wide}: {stats:?}");
-        assert_eq!(stats.fault_stores_guarded, 2, "wide={wide}: {stats:?}");
-        assert_eq!(stats.fault_urems_total, 2, "wide={wide}: {stats:?}");
-        assert_eq!(stats.fault_urems_guarded, 2, "wide={wide}: {stats:?}");
-        assert_eq!(stats.dir_loads_total, 2, "wide={wide}: {stats:?}");
-        assert_eq!(stats.dir_loads_guarded, 1, "wide={wide}: {stats:?}");
-        assert_eq!(stats.straddle_cmps, 1, "wide={wide}: {stats:?}");
-    }
+fn box32_straddle_fast_and_slow_paths_and_fast_bvh_validate_and_hit_on_card() {
+    let base = 0x12_3456_0000u64;
+    let _memory = Memory::at(base);
+    let (shader_exact, _) = build(true, WHOLE).expect("exact lowers");
+    let (shader_fast, _) = super::with_fast_bvh(true, || build(true, WHOLE)).expect("fast_bvh lowers");
 
-    // End-to-end GPU + WARP check over the real directory and faults buffer.
-    let (shader, _) = build_directory(true);
-    let base_idx = shader
-        .user_data
-        .iter()
-        .find(|u| u.root == RootType::Other(super::USER_MEMORY_BASE))
-        .expect("USER_MEMORY_BASE")
-        .index as usize;
-    let mut constants = vec![0u32; shader.user_data_dwords().max(5) as usize];
-    // Heap slots: 0 records SRV, 1 output UAV, 2 null view (base+0), 3 copy 1, 4 copy 2.
-    constants[base_idx] = 2;
+    let node = nodes::box32(
+        [0x105, 0x20c, 0x304, 0x400],
+        [
+            [29.0, -1.0, -1.0, 31.0, 1.0, 1.0],
+            [9.0, -1.0, -1.0, 11.0, 1.0, 1.0],
+            [f32::NAN; 6],
+            [19.0, -1.0, -1.0, 21.0, 1.0, 1.0],
+        ],
+    );
+    let ray = Ray::new([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 50.0);
+    let want = bvh::intersect(&node, 5, &ray, true);
+    assert_eq!(want, [0x20c, 0x400, 0x105, bvh::NONE]);
 
-    const UNIT: [f32; 6] = [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
-    let moved =
-        |b: [f32; 6], by: [f32; 3]| -> [f32; 6] { std::array::from_fn(|k| b[k] + by[k % 3]) };
-    let lined = [
-        moved(UNIT, [30.0, 0.0, 0.0]),
-        moved(UNIT, [10.0, 0.0, 0.0]),
-        moved(UNIT, [10.0, 5.0, 0.0]),
-        moved(UNIT, [20.0, 0.0, 0.0]),
-    ];
-    let ids = [0x105, 0x20c, 0x304, 0x400];
-    let box32_node = nodes::box32(ids, lined);
-    let box16_node = nodes::box16(ids, lined);
-    let front = [[0.0, 2.0, 5.0], [2.0, -2.0, 5.0], [-2.0, -2.0, 5.0]];
-    let tri_node = nodes::triangles(&front, 9);
-
-    let write_record = |buf: &mut [u32], t: usize, addr: u64, kind: u32, ray: Ray, active: bool| {
-        let r = &mut buf[t * (RECORD / 4) as usize..][..13];
-        let pointer = (addr >> 3) | u64::from(kind);
-        (r[0], r[1]) = (pointer as u32, (pointer >> 32) as u32);
-        r[2] = ray.extent.to_bits();
-        for a in 0..3 {
-            r[3 + a] = ray.origin[a].to_bits();
-            r[6 + a] = ray.direction[a].to_bits();
-            r[9 + a] = ray.inverse[a].to_bits();
+    // Place one node strictly inside the 64 KiB page (0xFF80) and one straddling
+    // the boundary into the next page (0xFFC0).
+    let mut data = vec![0u8; 0x1_0100];
+    let put_node = |buf: &mut [u8], off: usize| {
+        for (idx, word) in node.iter().enumerate() {
+            buf[off + idx * 4..off + idx * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
-        r[12] = u32::from(active);
     };
-
-    const SENTINEL: u32 = 0xDEAD_BEEF;
-    let ray_fwd = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 1000.0);
-    let ray_rev = Ray::new([40.0, 0.0, 0.0], [-2.0, 0.0, 0.0], 1000.0);
-    let ray_tri = Ray::new([0.0; 3], [0.0, 0.0, 1.0], 100.0);
-
-    // Copy 1 (64 KiB = 16384 dwords):
-    // - 0x0000: non-straddling box32
-    // - 0x0080: box16
-    // - 0x00C0: triangle
-    // - 0xFF80: last non-straddling box32 in the 64 KiB page
-    // Copy 2 (1024 dwords, poisoned except at byte offset 256): holds the second
-    // 64 bytes of a straddling box32 at 0x1_FFC0 in Dispatch 2.
-    let mut copy1_a = vec![0x7fc0_deadu32; 16384];
-    copy1_a[0..28].copy_from_slice(&box32_node);
-    copy1_a[0x80 / 4..0x80 / 4 + 16].copy_from_slice(&box16_node[..16]);
-    copy1_a[0xC0 / 4..0xC0 / 4 + 16].copy_from_slice(&tri_node[..16]);
-    copy1_a[0xFF80 / 4..0xFF80 / 4 + 28].copy_from_slice(&box32_node);
-
-    // Dispatch 1: only page 1 mapped; page 2 is unmapped.
-    let mut dir_a = vec![0u32; 32];
-    dir_a[2] = 1; // page 1 -> copy 1, offset 0
-    dir_a[3] = 0;
-    let mut recs_a = vec![0u32; (NODES / 4) as usize];
-    write_record(&mut recs_a, 0, 0x1_0000, 5, ray_fwd, true);
-    write_record(&mut recs_a, 1, 0x1_FF80, 5, ray_rev, true);
-    write_record(&mut recs_a, 2, 0x1_0080, 4, ray_fwd, true);
-    write_record(&mut recs_a, 3, 0x1_00C0, 0, ray_tri, true);
-
-    // Dispatch 2: straddling box32 at 0x1_FFC0 (first 64B in copy 1 @ 0xFFC0,
-    // second 64B in copy 2 @ 256) + active miss on page 5 + straddling 2nd-half
-    // miss on page 4 + masked-out miss on page 7.
-    let mut copy1_b = vec![0x7fc0_deadu32; 16384];
-    copy1_b[0..28].copy_from_slice(&box32_node);
-    copy1_b[0xFFC0 / 4..0x10000 / 4].copy_from_slice(&box32_node[..16]);
-    let mut copy2_b = vec![0x7fc0_deadu32; 1024];
-    copy2_b[256 / 4..256 / 4 + 12].copy_from_slice(&box32_node[16..28]);
-
-    let mut dir_b = vec![0u32; 32];
-    dir_b[2] = 1; // page 1 -> copy 1, offset 0
-    dir_b[3] = 0;
-    dir_b[4] = 2; // page 2 -> copy 2, offset 256
-    dir_b[5] = 256;
-    dir_b[6] = 1; // page 3 -> copy 1, offset 0 (page 4 left unmapped)
-    dir_b[7] = 0;
-
-    let mut recs_b = vec![0u32; (NODES / 4) as usize];
-    write_record(&mut recs_b, 0, 0x1_FFC0, 5, ray_fwd, true);
-    write_record(&mut recs_b, 1, 0x1_FFC0, 5, ray_rev, true);
-    write_record(&mut recs_b, 2, 0x1_0000, 5, ray_fwd, true);
-    write_record(&mut recs_b, 3, 0x5_0000, 5, ray_fwd, true); // active miss page 5
-    write_record(&mut recs_b, 4, 0x3_FFC0, 5, ray_fwd, true); // straddling 2nd-half miss page 4
-    write_record(&mut recs_b, 5, 0x7_0000, 5, ray_fwd, false); // masked-out miss page 7
-
-    let mut faults_init = vec![0u32; super::MEMORY_FAULTS as usize];
-    faults_init[0] = SENTINEL;
-
-    let want_fwd = bvh::intersect(&box32_node, 5, &ray_fwd, true);
-    let want_rev = bvh::intersect(&box32_node, 5, &ray_rev, true);
-    let want_b16 = bvh::intersect(&box16_node, 4, &ray_fwd, true);
-    let want_tri = bvh::intersect(&tri_node, 0, &ray_tri, true);
+    put_node(&mut data, 0xFF80);
+    put_node(&mut data, 0xFFC0);
+    for (t, node_off) in [0xFF80u64, 0xFFC0u64].into_iter().enumerate() {
+        let addr = base + node_off;
+        let ptr = ((addr >> 6) << 3) | 5;
+        let rec: [u32; 13] = [
+            ptr as u32,
+            (ptr >> 32) as u32,
+            ray.extent.to_bits(),
+            ray.origin[0].to_bits(),
+            ray.origin[1].to_bits(),
+            ray.origin[2].to_bits(),
+            ray.direction[0].to_bits(),
+            ray.direction[1].to_bits(),
+            ray.direction[2].to_bits(),
+            ray.inverse[0].to_bits(),
+            ray.inverse[1].to_bits(),
+            ray.inverse[2].to_bits(),
+            1,
+        ];
+        let at = t * RECORD as usize;
+        for (idx, word) in rec.iter().enumerate() {
+            data[at + idx * 4..at + idx * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+    }
 
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -867,204 +761,34 @@ fn the_directory_fault_store_is_guarded_and_non_straddling_box32_skips_second_lo
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        let (root, pso) = host
-            .compute_pipeline(&shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-
-        // Dispatch 1: steady-state hits.
-        let out_a = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![
-                        (0, Root::Constants(constants.clone())),
-                        (1, Root::Uav(faults_init.clone())),
-                        (
-                            2,
-                            Root::View {
-                                srv: true,
-                                data: dir_a.clone(),
+        for (mode, shader) in [("exact", &shader_exact), ("fast_bvh", &shader_fast)] {
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}/{mode}: compute_pipeline failed: {e}"));
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(vec![0; 5]))],
+                        views: &[
+                            View::Buffer {
+                                data: &data,
+                                stride: Stride::Raw,
                             },
-                        ),
-                    ],
-                    views: &[
-                        View::Buffer {
-                            data: &recs_a,
-                            stride: Stride::Raw,
-                        },
-                        View::RawUav(4 * THREADS),
-                        View::NullRawUav,
-                        View::RawUavData(&copy1_a),
-                        View::RawUavData(&copy2_b),
-                    ],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: dispatch A failed: {e}"));
-        assert_eq!(&out_a[0][0..4], &want_fwd, "{label}: A thread 0");
-        assert_eq!(&out_a[0][4..8], &want_rev, "{label}: A thread 1 (0x1_FF80)");
-        assert_eq!(&out_a[0][8..12], &want_b16, "{label}: A thread 2");
-        assert_eq!(&out_a[0][12..16], &want_tri, "{label}: A thread 3");
-        let faults_a = &out_a[1];
-        assert_eq!(
-            faults_a[0], SENTINEL,
-            "{label}: faults[0] was overwritten on valid memory accesses"
-        );
-        assert!(
-            faults_a[1..].iter().all(|&x| x == 0),
-            "{label}: unexpected fault on non-straddling hit"
-        );
-
-        // Dispatch 2: straddling node across two copies + active/masked misses.
-        let out_b = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![
-                        (0, Root::Constants(constants.clone())),
-                        (1, Root::Uav(faults_init.clone())),
-                        (
-                            2,
-                            Root::View {
-                                srv: true,
-                                data: dir_b.clone(),
-                            },
-                        ),
-                    ],
-                    views: &[
-                        View::Buffer {
-                            data: &recs_b,
-                            stride: Stride::Raw,
-                        },
-                        View::RawUav(4 * THREADS),
-                        View::NullRawUav,
-                        View::RawUavData(&copy1_b),
-                        View::RawUavData(&copy2_b),
-                    ],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: dispatch B failed: {e}"));
-        assert_eq!(&out_b[0][0..4], &want_fwd, "{label}: B straddling fwd");
-        assert_eq!(&out_b[0][4..8], &want_rev, "{label}: B straddling rev");
-        assert_eq!(&out_b[0][8..12], &want_fwd, "{label}: B non-straddling");
-        assert_eq!(&out_b[0][20..24], &BEFORE, "{label}: B masked-out lane");
-        let faults_b = &out_b[1];
-        assert_eq!(
-            faults_b[0], SENTINEL,
-            "{label}: faults[0] was overwritten during dispatch B"
-        );
-        for (i, &v) in faults_b.iter().enumerate().skip(1) {
-            let expected = match i {
-                5 => 4, // 1 + (4 % 4095)
-                6 => 5, // 1 + (5 % 4095)
-                _ => 0,
-            };
-            assert_eq!(v, expected, "{label}: faults[{i}] mismatch");
+                            View::RawUav(4 * THREADS),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}/{mode}: dispatch failed: {e}"));
+            assert_eq!(&out[0][0..4], &want, "{label}/{mode} non-straddle 0xFF80");
+            assert_eq!(&out[0][4..8], &want, "{label}/{mode} straddle 0xFFC0");
         }
         ran += 1;
     }
     assert!(ran > 0, "no SM 6.6 device available");
-}
-
-#[test]
-fn global_and_scalar_title_memory_ops_guard_faults_and_validate() {
-    // s[0:1] = raw 64-bit title address (root constants), s4 = descriptor table.
-    // Exercises s_load_dwordx8 (2 memory() calls), global_load_dword,
-    // global_store_dword, global_atomic_add (glc), and global_atomic_sub (glc).
-    let code: Vec<u32> = vec![
-        0xBE85_0380, // s_mov_b32 s5, 0
-        0xF408_0302,
-        0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], 0x0 (table UAV)
-        0xF40C_0400,
-        0xFA00_0000, // s_load_dwordx8 s[16:23], s[0:1], 0x0 (title memory)
-        0x7E02_0200, // v_mov_b32 v1, s0
-        0x7E04_0201, // v_mov_b32 v2, s1
-        0xDC30_8000,
-        0x037D_0001, // global_load_dword v3, v[1:2], null
-        0xDC70_8004,
-        0x007D_0301, // global_store_dword v[1:2], v3, null offset:4
-        0xDCC9_8008,
-        0x047D_0301, // global_atomic_add v4, v[1:2], v3, null offset:8 glc
-        0xDCCD_800C,
-        0x057D_0401, // global_atomic_sub v5, v[1:2], v4, null offset:12 glc
-        0x7E0C_0210, // v_mov_b32 v6, s16
-        0x7E0E_0217, // v_mov_b32 v7, s23
-        0x342A_0084, // v_lshlrev_b32 v21, 4, v0
-        0xE078_1000,
-        0x8003_0415, // buffer_store_dwordx4 v[4:7], v21, s[12:15], 0 offen
-        0xBF81_0000, // s_endpgm
-    ];
-    let prog = NativeProgram {
-        stage: HwStage::Cs,
-        wave64: false,
-        vgprs: 22,
-        layout: vec![
-            RootParam {
-                root: RootType::Constants,
-                table_offset_dwords: 0,
-                sgprs: 4,
-                base_register: 0,
-                user_data: 0,
-                slot: 0,
-            },
-            RootParam {
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 4,
-                slot: 1,
-            },
-        ],
-        used: vec![UsedResource {
-            kind: ResourceType::Uav,
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            lower_bound: 0,
-            stride: 4,
-            dwords: 4,
-            user_data: 4,
-            slot: 1,
-        }],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1,
-            threads: [THREADS, 1, 1],
-        }),
-        code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
-    let p = ir::build(&prog.code, prog.wave64, prog.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &prog.layout, prog.stage, Some(&st)).expect("tracked");
-    let io = io::raise(&p, &prog).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &prog,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-    })
-    .expect("memory_flat/memory_smem program lowers");
-    assert!(lowered.root_srvs.contains(&super::SLOT_MEMORY));
-    assert!(lowered.root_uavs.contains(&super::SLOT_FAULTS));
-    let stats = lowered.memory_ir;
-    assert_eq!(stats.fault_stores_total, 6, "{stats:?}");
-    assert_eq!(stats.fault_stores_guarded, 6, "{stats:?}");
-    assert_eq!(stats.fault_urems_total, 6, "{stats:?}");
-    assert_eq!(stats.fault_urems_guarded, 6, "{stats:?}");
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        let mut copy = lowered.dxil.clone();
-        v.validate(&mut copy).expect("DXIL validation failed");
-    }
 }

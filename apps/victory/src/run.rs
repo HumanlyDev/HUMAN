@@ -4,6 +4,37 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+#[cfg(any(windows, test))]
+const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
+
+#[cfg(any(windows, test))]
+fn skip_cpu_check(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(any(windows, test))]
+fn check_cpu_features_with(has_avx2: bool, skip_env: Option<&str>) -> Result<()> {
+    if has_avx2 || skip_cpu_check(skip_env) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "this CPU does not support AVX2, which Xbox Series titles require; \
+         set {SKIP_CPU_CHECK_ENV}=1 to bypass this check (for example under CPU emulation such as Intel SDE)"
+    );
+}
+
+/// Pre-flight check before executing title code: Xbox Series binaries are
+/// compiled for Zen 2 and require AVX2.
+#[cfg(windows)]
+fn check_cpu_features() -> Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    let has_avx2 = std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let has_avx2 = true;
+    let skip = std::env::var(SKIP_CPU_CHECK_ENV).ok();
+    check_cpu_features_with(has_avx2, skip.as_deref())
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -16,26 +47,19 @@ pub fn run(
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
+    if execute {
+        check_cpu_features()?;
+    }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
-    victory_gpu::display::set(victory_gpu::display::Settings {
-        fps_limit: cfg.display.fps_limit,
-        mode: if cfg.display.borderless {
-            victory_gpu::display::WindowMode::Borderless
-        } else {
-            victory_gpu::display::WindowMode::Windowed
-        },
-    });
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let mut prepared = victory_loader::prepare(&original)?;
+    let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    let build = victory_game::identify(&hash);
-    match build {
+    match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
-    apply_title_patches(&mut prepared, build)?;
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -44,6 +68,7 @@ pub fn run(
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in
     // physical memory: run 65's memory map).
+    let image_name = prepared.file_name();
     drop(prepared);
     drop(original);
     victory_hle::runtime::set_main_image(image.base());
@@ -86,6 +111,32 @@ pub fn run(
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
     }
+    let imported: Vec<&str> = image
+        .info()
+        .imports
+        .iter()
+        .map(|m| m.dll.as_str())
+        .collect();
+    let mapped: Vec<&str> = dlls.iter().map(|(name, _)| name.as_str()).collect();
+    let absent = absent_title_dlls(&imported, &mapped, &wanted);
+    if !absent.is_empty() {
+        let message = format!(
+            "{} not in {}, and neither the host nor VIctory provides {}: the package is \
+             incomplete; copy every file of the package next to the executable",
+            absent.join(", "),
+            title_dir.display(),
+            if absent.len() == 1 { "it" } else { "them" },
+        );
+        println!("missing dlls   {message}");
+        // None of their imports can be bound, so the title stops at its first
+        // call into one (Grand Theft Auto VI 1.0.2.1 at +0x2237178 during
+        // System Init, #930) with nothing saying why. Stubs only if asked for.
+        if execute && matches!(unimplemented, Unimplemented::Trap) {
+            anyhow::bail!(
+                "the title's own DLLs are missing: {message} (`--unimplemented zero` runs it anyway)"
+            );
+        }
+    }
 
     let policy = match unimplemented {
         Unimplemented::Trap => UnimplementedPolicy::Trap,
@@ -112,6 +163,11 @@ pub fn run(
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped, and nothing of it has run yet.
+        unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
@@ -146,8 +202,10 @@ pub fn run(
 #[cfg(all(windows, feature = "diagnostics"))]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::dump_stacks_on_schedule();
+    victory_loader::profile_on_schedule(victory_hle::frame_phase);
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
+    poke(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
     let size = image.info().size_of_image as usize;
@@ -167,34 +225,6 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
     );
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
-fn parse_watch_rvas(list: &str, size: usize) -> Vec<usize> {
-    list.split(',')
-        .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
-        .filter(|&rva| rva.checked_add(4).is_some_and(|end| end <= size))
-        .collect()
-}
-
-/// Reads a `u32` at `addr` without UB even when `addr` is not 4-byte aligned.
-///
-/// # Safety
-/// `addr..addr + 4` must be readable mapped memory.
-#[cfg(all(windows, feature = "diagnostics"))]
-unsafe fn read_watch_u32(addr: usize) -> u32 {
-    if addr.is_multiple_of(4) {
-        // SAFETY: caller guarantees `addr..addr + 4` is readable and we checked alignment.
-        unsafe { (addr as *const u32).read_volatile() }
-    } else {
-        let mut bytes = [0u8; 4];
-        let ptr = addr as *const u8;
-        for (i, byte) in bytes.iter_mut().enumerate() {
-            // SAFETY: caller guarantees `addr..addr + 4` is readable.
-            *byte = unsafe { ptr.add(i).read_volatile() };
-        }
-        u32::from_ne_bytes(bytes)
-    }
-}
-
 /// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each
 /// title+rva whenever it changes, polled every 5 ms (an engine's state, say).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -202,16 +232,17 @@ fn watch(base: usize, size: usize) {
     let Ok(list) = std::env::var("VICTORY_WATCH") else {
         return;
     };
-    let rvas = parse_watch_rvas(&list, size);
-    if rvas.is_empty() {
-        return;
-    }
+    let rvas: Vec<usize> = list
+        .split(',')
+        .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
+        .filter(|&rva| rva + 4 <= size)
+        .collect();
     std::thread::spawn(move || {
         let mut seen = vec![None; rvas.len()];
         loop {
             for (&rva, seen) in rvas.iter().zip(&mut seen) {
                 // SAFETY: four bytes inside the mapped image, checked above.
-                let value = unsafe { read_watch_u32(base + rva) };
+                let value = unsafe { ((base + rva) as *const u32).read_volatile() };
                 if *seen != Some(value) {
                     eprintln!("VIctory: title+{rva:#x} = {value:#x}");
                     *seen = Some(value);
@@ -222,10 +253,57 @@ fn watch(base: usize, size: usize) {
     });
 }
 
+/// Debugging aid: `VICTORY_POKE=<rva>:<byte>,...` (hex) writes the byte at
+/// each title+rva twice a second. A title that ends itself when its main
+/// loop has not ticked for a while (Grand Theft Auto VI: 30 s) runs on
+/// through slower frames with its tick flag poked. The address must be
+/// writable title data.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn poke(base: usize, size: usize) {
+    let Ok(list) = std::env::var("VICTORY_POKE") else {
+        return;
+    };
+    let hex = |s: &str| usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    let pokes: Vec<(usize, u8)> = list
+        .split(',')
+        .filter_map(|p| p.split_once(':'))
+        .filter_map(|(rva, byte)| Some((hex(rva)?, u8::try_from(hex(byte)?).ok()?)))
+        .filter(|&(rva, _)| rva < size)
+        .collect();
+    std::thread::spawn(move || {
+        loop {
+            for &(rva, byte) in &pokes {
+                // SAFETY: a byte inside the mapped image, checked above.
+                unsafe { ((base + rva) as *mut u8).write_volatile(byte) };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    });
+}
+
 /// DLLs the host or our runtime provide are never taken from the title.
 #[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
+}
+
+/// The DLLs among `imported` (the main image's static imports) that must
+/// come from the title's folder (`wanted`) but were not mapped from it:
+/// none of their imports can be bound. Each named once, case ignored.
+#[cfg(any(windows, test))]
+fn absent_title_dlls(
+    imported: &[&str],
+    mapped: &[&str],
+    wanted: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut absent: Vec<String> = Vec::new();
+    for &dll in imported {
+        let known = |list: &[&str]| list.iter().any(|m| m.eq_ignore_ascii_case(dll));
+        if wanted(dll) && !known(mapped) && !absent.iter().any(|a| a.eq_ignore_ascii_case(dll)) {
+            absent.push(dll.to_owned());
+        }
+    }
+    absent
 }
 
 /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
@@ -277,29 +355,12 @@ impl LateDlls {
                     inner: &old,
                     dlls: &new,
                 };
-                let mut reports = Vec::with_capacity(new.len());
                 for (name, dll) in &new {
                     println!(
                         "title dll      {name} at {:#x} (loaded by the title)",
                         dll.base()
                     );
-                    match dll.bind_imports(&resolver, self.policy) {
-                        Ok(report) => reports.push((name.as_str(), report)),
-                        Err(err) => {
-                            // Unmap every newly loaded DLL before returning so
-                            // none leak or linger unattached in `IMAGES`.
-                            for (_, dll) in new {
-                                // SAFETY: none were attached or exposed to title code yet.
-                                unsafe { dll.unload() };
-                            }
-                            return Err(err);
-                        }
-                    }
-                }
-                for (name, report) in reports {
-                    show(name, report);
-                }
-                for (name, dll) in &new {
+                    show(name, dll.bind_imports(&resolver, self.policy)?);
                     set_image_path(dll.base(), &self.title_dir.join(name));
                 }
                 // Visible before their `DllMain`s run, which may load more.
@@ -349,27 +410,59 @@ struct LoaderLock {
 #[cfg(windows)]
 impl LoaderLock {
     fn hold<T>(&self, f: impl FnOnce() -> T) -> T {
-        struct Guard<'a>(&'a LoaderLock);
-        impl Drop for Guard<'_> {
-            fn drop(&mut self) {
-                let mut owner = self.0.owner.lock().unwrap_or_else(|e| e.into_inner());
-                owner.1 -= 1;
-                if owner.1 == 0 {
-                    owner.0 = None;
-                    self.0.free.notify_one();
-                }
-            }
-        }
         let me = std::thread::current().id();
+        let lock = || self.owner.lock().unwrap_or_else(|e| e.into_inner());
         {
-            let mut owner = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut owner = lock();
             while owner.0.is_some_and(|o| o != me) {
                 owner = self.free.wait(owner).unwrap_or_else(|e| e.into_inner());
             }
             *owner = (Some(me), owner.1 + 1);
         }
-        let _guard = Guard(self);
-        f()
+        let result = f();
+        let mut owner = lock();
+        owner.1 -= 1;
+        if owner.1 == 0 {
+            owner.0 = None;
+            self.free.notify_one();
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod absent_tests {
+    use super::absent_title_dlls;
+
+    #[test]
+    fn title_dlls_missing_from_the_folder_are_named_once() {
+        // The host provides kernel32, our runtime d3d12_xs; the rest are the
+        // title's own (#930: the four DLLs beside the executable missing).
+        let wanted = |dll: &str| {
+            !["KERNEL32.dll", "d3d12_xs.dll"]
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(dll))
+        };
+        let imported = [
+            "KERNEL32.dll",
+            "d3d12_xs.dll",
+            "XboxBvhBuilder.dll",
+            "MSVCP140.dll",
+            "Bink2Scarlett.dll",
+            "xboxbvhbuilder.dll",
+        ];
+        let mapped = ["msvcp140.dll"];
+        assert_eq!(
+            absent_title_dlls(&imported, &mapped, &wanted),
+            ["XboxBvhBuilder.dll", "Bink2Scarlett.dll"]
+        );
+    }
+
+    #[test]
+    fn a_complete_package_has_nothing_absent() {
+        let wanted = |dll: &str| dll.starts_with("Title");
+        assert!(absent_title_dlls(&["Title.dll", "Host.dll"], &["TITLE.DLL"], &wanted).is_empty());
+        assert!(absent_title_dlls(&[], &[], &wanted).is_empty());
     }
 }
 
@@ -396,98 +489,46 @@ mod tests {
     }
 
     #[test]
-    fn loader_lock_releases_on_panic() {
-        let lock = Arc::new(super::LoaderLock::default());
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            lock.hold(|| {
-                lock.hold(|| panic!("boom"));
-            });
-        }));
-        assert!(panicked.is_err());
+    fn cpu_feature_check_matches_host() {
+        let skip = std::env::var(super::SKIP_CPU_CHECK_ENV).ok();
+        #[cfg(target_arch = "x86_64")]
+        let expected_ok =
+            std::arch::is_x86_feature_detected!("avx2") || skip.as_deref() == Some("1");
+        #[cfg(not(target_arch = "x86_64"))]
+        let expected_ok = true;
+        assert_eq!(super::check_cpu_features().is_ok(), expected_ok);
+    }
+}
 
-        // Another thread must be able to acquire the lock without deadlocking.
-        let theirs = lock.clone();
-        let got = std::thread::spawn(move || theirs.hold(|| 42))
-            .join()
-            .unwrap();
-        assert_eq!(got, 42);
+#[cfg(test)]
+mod cpu_check_tests {
+    use super::{SKIP_CPU_CHECK_ENV, check_cpu_features_with};
+
+    #[test]
+    fn avx2_present_passes() {
+        assert!(check_cpu_features_with(true, None).is_ok());
+        assert!(check_cpu_features_with(true, Some("0")).is_ok());
+        assert!(check_cpu_features_with(true, Some("1")).is_ok());
     }
 
-    #[cfg(feature = "diagnostics")]
     #[test]
-    fn watch_helpers_reject_overflow_and_read_unaligned() {
-        let rvas = super::parse_watch_rvas("0x0, 0x1, fffffffffffffffe, 0x10", 0x10);
-        assert_eq!(rvas, [0, 1]);
-        assert!(super::parse_watch_rvas("bad, fffffffffffffffd", 0x10).is_empty());
+    fn avx2_missing_fails_with_clear_error() {
+        for skip in [None, Some(""), Some("0"), Some("true")] {
+            let err = check_cpu_features_with(false, skip).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("AVX2"), "unexpected error: {msg}");
+            assert!(msg.contains("Xbox Series"), "unexpected error: {msg}");
+            assert!(msg.contains(SKIP_CPU_CHECK_ENV), "unexpected error: {msg}");
+        }
+    }
 
-        let bytes: [u8; 8] = [0x00, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00];
-        let base = bytes.as_ptr() as usize;
-        // SAFETY: `bytes` has 8 readable bytes; offset 1 is intentionally unaligned.
-        let unaligned = unsafe { super::read_watch_u32(base + 1) };
-        assert_eq!(unaligned, u32::from_ne_bytes([0x78, 0x56, 0x34, 0x12]));
+    #[test]
+    fn skip_env_var_bypasses_missing_avx2() {
+        assert!(check_cpu_features_with(false, Some("1")).is_ok());
     }
 }
 
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
-}
-
-/// Bytes as lower-case hex.
-#[cfg(windows)]
-fn hex_str(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// The known build's code patches (`VICTORY_TITLE_PATCHES=0`: none), then
-/// any from `VICTORY_TITLE_PATCH=<rva>:<old hex>:<new hex>,...`. The old
-/// bytes must be there (another build of the title is refused), and the
-/// patched copy has a file name of its own.
-#[cfg(windows)]
-fn apply_title_patches(
-    prepared: &mut victory_loader::PreparedImage,
-    build: Option<&victory_game::KnownBuild>,
-) -> Result<()> {
-    let mut patches = Vec::new();
-    let mut names = Vec::new();
-    if std::env::var("VICTORY_TITLE_PATCHES").as_deref() != Ok("0") {
-        for p in build.map_or(&[][..], |b| b.patches) {
-            patches.push((p.rva, p.expect.to_vec(), p.write.to_vec()));
-            names.push(p.name.to_owned());
-        }
-    }
-    let spec = std::env::var("VICTORY_TITLE_PATCH").unwrap_or_default();
-    for one in spec.split(',').filter(|p| !p.trim().is_empty()) {
-        let parts: Vec<&str> = one.split(':').collect();
-        anyhow::ensure!(
-            parts.len() == 3,
-            "VICTORY_TITLE_PATCH entry is not <rva>:<old>:<new>: {one}"
-        );
-        let rva = u32::from_str_radix(parts[0].trim().trim_start_matches("0x"), 16)?;
-        patches.push((rva, from_hex(parts[1])?, from_hex(parts[2])?));
-        names.push("VICTORY_TITLE_PATCH".to_owned());
-    }
-    if patches.is_empty() {
-        return Ok(());
-    }
-    prepared.patch(&patches)?;
-    for ((rva, old, new), name) in patches.iter().zip(names) {
-        println!(
-            "title patch    +{rva:#x} {name}: {} -> {}",
-            hex_str(old),
-            hex_str(new)
-        );
-    }
-    Ok(())
-}
-
-/// Bytes from hex digits.
-#[cfg(windows)]
-fn from_hex(s: &str) -> Result<Vec<u8>> {
-    let s = s.trim();
-    anyhow::ensure!(s.len().is_multiple_of(2), "odd hex length: {s}");
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(anyhow::Error::from))
-        .collect()
 }

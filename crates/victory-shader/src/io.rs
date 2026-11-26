@@ -211,29 +211,20 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             (loaded, &inputs[..], &[][..])
         }
         (StageIo::Vs { inputs, outputs }, HwStage::Vs) => {
-            // The fetch shader runs before the VS body and overwrites
-            // hardware-initialized VGPRs (v0..v3) when VertexId/InstanceId are
-            // not needed after fetch, so register fetched attributes ahead of
-            // the hardware fallbacks.
-            let mut loaded = Vec::new();
+            let mut loaded = vec![
+                (Reg::V(0), Input::VertexId),
+                (Reg::V(2), Input::PrimitiveId),
+                (Reg::V(3), Input::InstanceId),
+            ];
             for i in inputs {
                 for channel in (0..4).filter(|c| i.mask >> c & 1 != 0) {
-                    let vgpr = i
-                        .vgpr
-                        .checked_add(channel)
-                        .ok_or(ShaderError::Malformed("vertex input VGPR out of range"))?;
                     let input = Input::Attribute {
                         row: i.row,
                         channel,
                     };
-                    loaded.push((Reg::V(vgpr), input));
+                    loaded.push((Reg::V(i.vgpr + channel), input));
                 }
             }
-            loaded.extend([
-                (Reg::V(0), Input::VertexId),
-                (Reg::V(2), Input::PrimitiveId),
-                (Reg::V(3), Input::InstanceId),
-            ]);
             (loaded, &[][..], &outputs[..])
         }
         // Compute: thread ids in v0-v2, group ids and the group info in the
@@ -378,6 +369,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         defs: &defs,
         phis: &phis,
     };
+    let mut first_halves = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -391,7 +383,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {}
+                        ("v_interp_p1_f32", _) => first_halves.push((site, attribute)),
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
@@ -411,7 +403,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
-                    "v_interp_p1ll_f16" => {}
+                    "v_interp_p1ll_f16" => {
+                        first_halves.push((site, attribute(inst, &v.src[0])?));
+                    }
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
                         let read = |k: usize| match v.src.get(k) {
@@ -467,6 +461,52 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 }
                 _ => {}
             }
+        }
+    }
+    if first_halves.is_empty() {
+        return Ok(io);
+    }
+    // A loaded i/j pair normally becomes one host interpolation: its first
+    // half need not be evaluated. A first half also read as data (or used
+    // without a second half) must keep P0 + i * P10. Follow phi uses too,
+    // without forcing ordinary pairs to read per-vertex attributes.
+    let folded: std::collections::HashSet<_> = io
+        .interps
+        .iter()
+        .filter_map(|(s, i)| matches!(i, Interp::Interpolated { .. }).then_some(*s))
+        .collect();
+    let mut used: std::collections::HashSet<_> = p
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(b, blk)| {
+            blk.insts
+                .iter()
+                .enumerate()
+                .map(move |(i, inst)| ((b, i), inst))
+        })
+        .filter(|(s, _)| !folded.contains(s))
+        .flat_map(|(_, inst)| inst.reads.iter().map(|r| r.1))
+        .collect();
+    loop {
+        let before = used.len();
+        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+            if used.contains(&phi.value) {
+                used.extend(&phi.args);
+            }
+        }
+        if used.len() == before {
+            break;
+        }
+    }
+    for (site, attribute) in first_halves {
+        if !io.interps.iter().any(|(s, _)| *s == site)
+            && p.blocks[site.0].insts[site.1]
+                .writes
+                .iter()
+                .any(|w| used.contains(&w.1))
+        {
+            io.interps.push((site, Interp::Weighted { attribute }));
         }
     }
     Ok(io)
@@ -735,6 +775,50 @@ mod tests {
     }
 
     #[test]
+    fn first_halves_read_through_a_phi_keep_their_partial_values() {
+        let p = program(&[
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 -> second first half
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xBF82_0001, // s_branch -> export
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert_eq!(io.interps.len(), 2);
+        assert!(
+            io.interps
+                .iter()
+                .all(|(_, i)| matches!(i, Interp::Weighted { .. }))
+        );
+    }
+
+    #[test]
+    fn a_standalone_f16_first_half_is_weighted() {
+        let p = program(&[
+            0xD742_0002,
+            0x0002_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+            0xF800_180F,
+            0x0202_0202,
+            S_ENDPGM,
+        ]);
+        let io = raise(
+            &p,
+            &pixel(
+                vec![PsInput {
+                    fp16: true,
+                    ..TEXCOORD
+                }],
+                2,
+            ),
+        )
+        .unwrap();
+        assert!(matches!(&io.interps[..], [(_, Interp::Weighted { .. })]));
+    }
+
+    #[test]
     fn mesh_inputs_and_primitive_export() {
         let mesh = |words: &[u32]| {
             let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -831,100 +915,5 @@ mod tests {
                 (3, Input::Position(1)),
             ]
         );
-    }
-
-    #[test]
-    fn vs_fetched_attributes_in_v0_to_v3_override_hardware_ids_and_reject_vgpr_overflow() {
-        use crate::native::VsInput;
-
-        // `exp pos0, v0, v1, v2, v3 done; s_endpgm`
-        let words: &[u32] = &[0xF800_08CF, 0x0302_0100, S_ENDPGM];
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let p = crate::ir::build(&code, true, 256).unwrap();
-
-        let make_vs = |inputs: Vec<VsInput>| NativeProgram {
-            stage: HwStage::Vs,
-            wave64: true,
-            vgprs: 256,
-            layout: vec![],
-            used: vec![],
-            io: StageIo::Vs {
-                inputs,
-                outputs: vec![],
-            },
-            code: code.clone(),
-        };
-
-        // Fetched 4-channel attribute placed at v0..v3 must shadow VertexId,
-        // PrimitiveId, and InstanceId rather than miscompiling them.
-        let io = raise(
-            &p,
-            &make_vs(vec![VsInput {
-                usage: Usage::Generic,
-                row: 0,
-                mask: 0b1111,
-                vgpr: 0,
-            }]),
-        )
-        .unwrap();
-        let mapped: Vec<(Reg, Input)> = p
-            .inputs
-            .iter()
-            .filter_map(|&(r, v)| io.inputs.iter().find(|&&(iv, _)| iv == v).map(|&(_, inp)| (r, inp)))
-            .collect();
-        assert_eq!(
-            mapped,
-            vec![
-                (Reg::V(0), Input::Attribute { row: 0, channel: 0 }),
-                (Reg::V(1), Input::Attribute { row: 0, channel: 1 }),
-                (Reg::V(2), Input::Attribute { row: 0, channel: 2 }),
-                (Reg::V(3), Input::Attribute { row: 0, channel: 3 }),
-            ]
-        );
-
-        // Unclaimed v0/v2/v3 still fall back to VertexId/PrimitiveId/InstanceId.
-        let io_fallback = raise(
-            &p,
-            &make_vs(vec![VsInput {
-                usage: Usage::Generic,
-                row: 1,
-                mask: 0b0001,
-                vgpr: 1,
-            }]),
-        )
-        .unwrap();
-        let mapped_fb: Vec<(Reg, Input)> = p
-            .inputs
-            .iter()
-            .filter_map(|&(r, v)| {
-                io_fallback
-                    .inputs
-                    .iter()
-                    .find(|&&(iv, _)| iv == v)
-                    .map(|&(_, inp)| (r, inp))
-            })
-            .collect();
-        assert_eq!(
-            mapped_fb,
-            vec![
-                (Reg::V(0), Input::VertexId),
-                (Reg::V(1), Input::Attribute { row: 1, channel: 0 }),
-                (Reg::V(2), Input::PrimitiveId),
-                (Reg::V(3), Input::InstanceId),
-            ]
-        );
-
-        // Malformed VGPR >= 253 with upper channel bit set must error instead of overflowing u8.
-        let err = raise(
-            &p,
-            &make_vs(vec![VsInput {
-                usage: Usage::Generic,
-                row: 0,
-                mask: 0b1111,
-                vgpr: 254,
-            }]),
-        )
-        .unwrap_err();
-        assert_eq!(err, ShaderError::Malformed("vertex input VGPR out of range"));
     }
 }

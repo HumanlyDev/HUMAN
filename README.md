@@ -1,48 +1,60 @@
 # HUMAN
 
-An experimental Xbox Series X|S to Windows x86-64 / Direct3D 12 compatibility layer written in Rust.
+An experimental Xbox Series X|S to Windows x86-64 / Direct3D 12 compatibility layer written in Rust, synced with CGBJ (`codec-d/cool_fox`) Pareto residency and submission optimizations and tuned for Ray-Traced Global Illumination on NVIDIA and AMD GPUs.
 
-**HUMAN** loads a user-supplied Xbox Series title executable directly in a Windows x86-64 process, provides user-mode runtime services, translates console GPU command lists to host Direct3D 12, detiles console textures, and recompiles console GPU shaders to DirectX Shader Model 6.6 DXIL ahead of time or on demand.
+**HUMAN** loads a user-supplied Xbox Series title executable directly in a Windows x86-64 process, provides user-mode runtime services, translates console GPU command lists across parallel worker threads to host Direct3D 12, detiles console textures, and recompiles RDNA2 console GPU shaders to validated DirectX Shader Model 6.6 DXIL.
 
 > **Important Notice (No Game Files Included):**
 > This repository contains **only original compatibility-layer source code and documentation**. No game executables, archives, shaders, textures, audio, keys, or proprietary assets are included or distributed here. You must supply your own legally obtained files stored **outside** the repository (enforced by `.gitignore` and `cargo xtask policy`). This project is not affiliated with or endorsed by Microsoft or any game developer or publisher.
 
 > **Optimization Pull Requests Wanted:**
-> We are actively looking for **Pull Requests focused on CPU, GPU, memory, and shader optimizations**! See [Contributing & Optimization Targets](#contributing--optimization-targets) below for the highest-impact bottlenecks.
+> We are actively looking for **Pull Requests focused on CPU, GPU, memory, and shader optimizations**! See [Contributing & Optimization Targets](#contributing--optimization-targets) below.
+
+---
+
+## Current Compatibility & Performance Status
+
+| Metric | Status |
+|---|---|
+| **RTX 4060 (8 GB) Performance** | **~8 FPS** baseline (tuned for **10+ FPS** with optimized Ray-Traced Global Illumination enabled; higher on upper-tier RTX / Radeon GPUs) |
+| **Story Progression** | **~50% of the main story** reachable |
+| **Rendering & Global Illumination** | **Lit / close to console** — full console Ray-Traced Global Illumination (`ScreenProbes`, `IrradianceCache`, `PrimaryProbes`, `SkyVisibility`, `RaytracingResolve`) via Wave32-compatible `XboxBvhBuilder` + accelerated inline DXIL ray-node traversal, plus directional screen-space SH radiance fallback when RT is disabled |
+| **Stability** | **Good stability — rarely crashes** (Pareto VRAM/commit residency budgets, upload-before-publish bindless barriers, cold BVH arena page recycling, and CPU texture read-back for water/physics) |
 
 ---
 
 ## Key Features & Enhancements
 
-- **User-Mode Loader & Runtime HLE** (`victory-pe`, `victory-loader`, `victory-hle`): Loads x86-64 PE binaries, provides offline user/licensing/storage stubs, XInput & keyboard input mapping, and parallel DirectStorage / zlib / BCPack decompression.
-- **Console Shader Recompiler to SM 6.6 DXIL** (`victory-shader`): Translates console GPU bytecode to validated DXIL with dead-code, constant-folding, value-reuse, and branch-fact optimization passes (`VICTORY_SHADER_OPT`), plus configurable per-stage loop caps (`VICTORY_SHADER_LOOP_LIMIT`, `VICTORY_SHADER_LOOP_LIMIT_CS`).
-- **Direct3D 12 Backend** (`victory-gpu`):
-  - Bindless descriptor heap mirroring, mesh shader support, and rectangle list geometry expansion.
-  - Indirect draw/dispatch argument clamping with dense-stride batch windows (`VICTORY_INDIRECT_WINDOW`) and exact placed buffer views to avoid unused whole-buffer shadow allocations.
-  - Ambient indirect diffuse fallback (`VICTORY_AMBIENT`) for Wave32 GPUs when ray-tracing acceleration structures are not built.
-- **8 GB VRAM & Streaming Optimizations**:
-  - Host mip-level dropping (`VICTORY_TEXTURE_DROP_MIPS=1` or `2`) for large 2D textures.
-  - On-demand tiled mip residency (`VICTORY_LEVELS_ON_DEMAND=1`) and 64 MiB placed texture heaps (`VICTORY_PLACED_TEX=1`).
-  - GPU-resident shadow buffers (`VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_CARD_BUFFERS_MB=512`) and zero-copy in-place private heaps (`VICTORY_INPLACE=1`).
-- **Multi-Threaded Submission & Relay**:
-  - Async submission thread (`VICTORY_ASYNC_SUBMIT=1`), dual-queue copy-back relay (`VICTORY_RELAY=2`, `VICTORY_QUEUE2=1`), SIMD relay merge, and hybrid CPU fast-core thread scheduling.
-- **Console Profiles**: Supports both Series X (`--console series-x`, default) and Series S (`--console series-s`, recommended for 8 GB GPUs).
+- **CGBJ / `cool_fox` Multi-Threaded Submission & Pareto Residency:**
+  - Thin command recording & 8-way parallel translation (`VICTORY_THIN=1`, `VICTORY_JOIN_PARTS=8`).
+  - Dedicated copy-queue uploads with upload-before-publish visibility (`VICTORY_UPLOAD_AHEAD=1`, `VICTORY_SHOW_AFTER=1`), async copy-back relay (`VICTORY_RELAY=2`, `VICTORY_WIDE_BACK=1`, `VICTORY_RELAY_COPY=1`), and GPU-side card steps (`VICTORY_CARD_STEPS=2`).
+  - 32 GB RAM & 8 GB VRAM residency budgets (`pool.rs`, `residency.rs`, `VICTORY_CARD_BUFFERS_MIN_KB=64`, `VICTORY_LEVELS_ON_DEMAND=1`), plus CPU texture read-back (`VICTORY_TEXTURE_BACK`) and two-plane compose fixes.
+- **Optimized Ray-Traced Global Illumination (`VICTORY_RT_GI=1`):**
+  - Automatic Wave32 lowering for `XboxBvhBuilder` (`FIRSTLANE_OWN` on spilled builder scans, safe `WAVE_WIDE` widening for single-wave builder and GI trace/resolve kernels) so NVIDIA Wave32 GPUs (including RTX 4060) run full dynamic + static BVH global illumination.
+  - **GI-only ray filter:** keeps diffuse GI probes and irradiance shadow visibility enabled while skipping expensive full-res reflection and direct-shadow ray passes (`VICTORY_RT_ALL=1`, `VICTORY_RT_REFLECTIONS=1`, or `VICTORY_RT_SHADOWS=1` re-enable them).
+  - **64 KiB BVH page-straddle fast path:** skips the second `SLOT_MEMORY` lookup and heap handle creation on 99.9% of 128-byte `BOX32` nodes.
+  - **Hardware `FMad` BVH slab tests (`VICTORY_FAST_BVH=1`)** and **bounded ray traversal (`VICTORY_RT_LOOP_LIMIT=96`)** + fence-free builder atomics (`VICTORY_BVH_FENCES=0`).
+  - **VRAM-scaled BVH arena budget & cold-page eviction:** caps `memory.rs` arenas at 1,280 MiB on 8–10 GB GPUs (2 GiB on 12–16 GB, 3 GiB on 24 GB) and recycles cold unowned pages instead of stalling.
+- **DirectStorage & BCPack (`victory-hle`):**
+  - Parallel DirectStorage / zlib / BCPack decompression, plus optional DX12 Async Compute BCPack offload (`--features gpu-bcpack` + `VICTORY_GPU_BCPACK=1` via `bcpack-gpu-sdk v0.13.0`).
+- **Directional Screen-Space Indirect Fallback (`ambient.rs`):**
+  - When RT GI is off, estimates directional first-order SH indirect bounce from `CS_CacheScreenSpaceRadiance` (`VICTORY_AMBIENT=0.8`) and clamps indoor fog scattering (`VICTORY_AMBIENT_AIR=1.5`).
 
 ---
 
 ## Workspace Architecture
 
 | Crate | Purpose |
-|-------|---------|
-| `apps/victory` | CLI entry point (`run`, `translate`, `inspect`, `census`, `shader-info`, `config`) |
+|---|---|
+| `apps/victory` | CLI entry point (`run`, `translate`, `shaders`, `warm`, `inspect`, `census`, `replay`, `config`) |
 | `crates/victory-core` | Configuration (`victory.toml`), paths, and repo-safety checks |
 | `crates/victory-pe` | PE parsing and import/export inspection |
 | `crates/victory-loader` | Binary mapping, relocations, and runtime patching |
-| `crates/victory-hle` | Console OS, filesystem, threading, audio, and input HLE |
-| `crates/victory-gpu` | Direct3D 12 translation, memory shadows, textures, and indirect execution |
-| `crates/victory-shader` | Console GPU ISA decoder, IR lowering, optimization, and DXIL emitter |
-| `crates/victory-formats` | Console texture swizzle/detile layouts, BCPack, and audio formats |
-| `crates/victory-pipeline` | Pipeline state tracking and caching |
+| `crates/victory-hle` | Console OS, filesystem, DirectStorage, threading, audio, and input HLE |
+| `crates/victory-gpu` | Direct3D 12 translation, memory shadows, textures, BVH arenas, and indirect execution |
+| `crates/victory-shader` | Console GPU ISA decoder, IR lowering, Wave32/Wave64 passes, and DXIL emitter |
+| `crates/victory-formats` | Console texture swizzle/detile layouts, BCPack, and XMA/Opus audio formats |
+| `crates/victory-pipeline` | Pipeline state tracking and content-addressed caching |
 | `crates/victory-game` | Title-agnostic build identity matching and container helpers |
 | `xtask` | Asset-policy enforcement (`cargo xtask policy`) and git hook installer |
 
@@ -52,9 +64,9 @@ An experimental Xbox Series X|S to Windows x86-64 / Direct3D 12 compatibility la
 
 - **OS:** Windows 10 / 11 x64
 - **CPU:** x86-64 with AVX2
-- **GPU:** Direct3D 12 with Shader Model 6.6 & Mesh Shaders
-- **SDK:** Windows 10/11 SDK (`dxcompiler.dll` / `dxil.dll`, e.g. `C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64` via `XCL_DXC_DIR`)
-- **Toolchain:** Rust (pinned in [rust-toolchain.toml](rust-toolchain.toml))
+- **GPU:** Direct3D 12 with Shader Model 6.6 & Mesh Shaders (8 GB+ VRAM; tuned for NVIDIA RTX 4060 and up + AMD RDNA2/3)
+- **SDK:** Visual Studio Build Tools (C++ x64) + Windows 10/11 SDK (`dxcompiler.dll` / `dxil.dll`)
+- **Toolchain:** Rust pinned in [rust-toolchain.toml](rust-toolchain.toml)
 
 ```powershell
 # 1. Install the asset-policy pre-commit hook
@@ -64,40 +76,48 @@ cargo xtask install-hooks
 copy victory.example.toml victory.toml
 
 # 3. Run unit tests & asset-policy verification (no external files required)
-cargo test --workspace
+cargo test --workspace --locked
 cargo run -p xtask -- policy
 
-# 4. Build the release binary
-cargo build --release -p victory
+# 4. Build the release binary (add --features gpu-bcpack for optional GPU BCPack offload)
+cargo build --release --locked -p victory
 ```
 
 ---
 
 ## Usage
 
-### Pre-Warm Shaders
+### Quick Launch (NVIDIA / RTX 4060+ with Ray-Traced GI)
 
-Pre-translating shaders avoids cold-compile stalls in-game. Ensure `VICTORY_SHADER_LOOP_LIMIT_CS` matches the value you use when running, because the shader cache keys on it:
+Using `Play-HUMAN.cmd` (or `Play-VIctory.cmd` for CGBJ defaults):
 
 ```powershell
-$env:XCL_DXC_DIR = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64"
-$env:XCL_ADAPTER = "nvidia"
-$env:VICTORY_SHADER_LOOP_LIMIT_CS = "192"
-.\target\release\victory.exe translate "<path-to-shader-archive>" --warm all
+$env:VICTORY_GAME_DIR = "D:\Games\YourDump"
+
+# Tuned Pareto residency + Ray-Traced Global Illumination (target 10+ FPS)
+.\Play-HUMAN.cmd rt-gi
+
+# Fast Pareto residency with screen-space SH ambient fallback
+.\Play-HUMAN.cmd pareto-residency
 ```
 
-### Run a Title
-
-Use the tuned NVIDIA launcher script (Series S profile recommended for 8 GB VRAM GPUs):
+Or using `scripts\play-nvidia.ps1`:
 
 ```powershell
-.\scripts\play-nvidia.ps1 -Title "<path-to-title.exe>" -Console series-s
+.\scripts\play-nvidia.ps1 -Title "<path-to-title.exe>" -Console series-s -RayTracing
 ```
 
 Or invoke `victory.exe` directly:
 
 ```powershell
-.\target\release\victory.exe run "<path-to-title.exe>" --execute --console series-s
+.\target\release\victory.exe run "<path-to-title.exe>" --console series-s --execute
+```
+
+### Pre-Warm Shaders & Pipelines
+
+```powershell
+.\target\release\victory.exe shaders "<path-to-shader-archives>"
+.\target\release\victory.exe warm --used
 ```
 
 ### Keyboard Stand-In Controls
@@ -105,7 +125,7 @@ Or invoke `victory.exe` directly:
 When no XInput controller is connected, the keyboard maps to a standard pad while the window has focus:
 
 | Keys | Pad Input |
-|------|-----------|
+|---|---|
 | `W A S D` / `I J K L` | Left / Right Stick |
 | Arrow keys | D-Pad |
 | `Enter`, `Backspace`, `X`, `Y` | A, B, X, Y |
@@ -119,51 +139,44 @@ When no XInput controller is connected, the keyboard maps to a standard pad whil
 ## Key Environment Switches
 
 | Variable | Recommended | Effect |
-|----------|-------------|--------|
+|---|---|---|
 | `XCL_ADAPTER` | `nvidia` | Selects the discrete GPU on hybrid systems |
-| `VICTORY_AMBIENT` | `0.6` | Injects indirect diffuse fallback on Wave32 GPUs |
-| `VICTORY_TEXTURE_DROP_MIPS` | `1` (Series S) / `2` (4K) | Drops `N` largest mip levels on host copies to fit 8 GB VRAM |
-| `VICTORY_LEVELS_ON_DEMAND` | `1` | Allocates tiled texture mips on demand |
-| `VICTORY_PLACED_TEX` | `1` | Sub-allocates placed textures from 64 MiB heaps |
-| `VICTORY_CARD_BUFFERS_MIN_MB` | `1` | Promotes buffers `>= 1 MiB` to GPU-resident shadow copies |
-| `VICTORY_CARD_BUFFERS_MB` | `512` | GPU-resident buffer shadow budget (MiB) |
-| `VICTORY_INPLACE` | `1` | Zero-copy private heap placement for eligible buffers |
-| `VICTORY_RELAY` | `2` | Enables async copy-back relay thread |
-| `VICTORY_ASYNC_SUBMIT` | `1` | Offloads command-list preparation/submission from render thread |
-| `VICTORY_QUEUE2` | `1` | Uses copy queue for shader write-back fetches |
-| `VICTORY_INDIRECT_WINDOW` | `1` | Clamps consecutive indirect draws in batch windows |
-| `VICTORY_SHADER_LOOP_LIMIT_CS` | `192` | Caps compute shader loop iterations per lane (part of cache key) |
-| `VICTORY_FPS_LIMIT` | `0` / `30` / `60` | Caps host presentation rate |
+| `VICTORY_RT_GI` | `1` | Enables BVH builder + diffuse GI ray tracing while skipping full-res reflection/shadow ray passes |
+| `VICTORY_BVH_BUILDER` | `1` | Runs the console's GPU BVH builder (automatically enabled by `VICTORY_RT_GI=1`) |
+| `VICTORY_BVH_FENCES` | `0` | Drops redundant per-atomic UAV fences in builder stages (defaults to `0` under `VICTORY_RT_GI=1`) |
+| `VICTORY_FAST_BVH` | `1` | Uses hardware `FMad` + precomputed `-origin * inverse` in BVH box slab tests |
+| `VICTORY_RT_LOOP_LIMIT` | `96` | Caps divergent BVH traversal loop iterations per ray |
+| `VICTORY_MEMORY_CARD_MB` | auto | Overrides BVH title-memory arena cap (`1280` MiB auto on 8–10 GB GPUs) |
+| `VICTORY_THIN` / `VICTORY_JOIN_PARTS` | `1` / `8` | Records commands thinly and translates across 8 worker threads |
+| `VICTORY_RELAY` / `VICTORY_WIDE_BACK` | `2` / `1` | Async GPU readback relay with wide AVX2 diff/merge |
+| `VICTORY_UPLOAD_AHEAD` / `VICTORY_SHOW_AFTER` | `1` / `1` | Dedicated copy-queue texture uploads published only after completion |
+| `VICTORY_CARD_BUFFERS_MIN_KB` | `64` | Promotes buffers `>= 64 KiB` to GPU-resident shadow copies |
+| `VICTORY_AMBIENT` / `VICTORY_AMBIENT_AIR` | `0.8` / `1.5` | Directional screen-space SH indirect fallback + indoor fog clamp when RT is off |
 
 ---
 
 ## Contributing & Optimization Targets
 
-**Pull requests for performance and memory optimizations are very welcome.** Whether it's shaving microseconds off per-draw CPU overhead, reducing GPU command-list barriers, improving VRAM residency on 8 GB cards, or tightening DXIL shader codegen, every measurable improvement helps.
+**Pull requests for performance, RT throughput, and memory optimizations are very welcome.**
 
-High-impact areas to target:
-
-1. **Indirect Execution & Draw Submission (`crates/victory-gpu/src/indirect.rs`, `draw.rs`):**
-   - Reducing per-record argument clamping overhead and coalescing barriers/dispatches across indirect draw windows.
-   - Cutting per-draw descriptor table, root-parameter, and command-signature overhead.
-2. **CPU <-> GPU Shadow Memory & Relay (`crates/victory-gpu/src/shadow.rs`, `plaincopy.rs`, `inplace.rs`):**
-   - Optimizing dirty-page scanning, SIMD diff/merge throughput, and copy-back latency.
-   - Expanding safe zero-copy `VICTORY_INPLACE` heap coverage.
-3. **8 GB VRAM Residency & Texture Streaming (`crates/victory-gpu/src/texture.rs`, `tiles.rs`, `placed.rs`):**
-   - Faster tiled/BC detiling, lower staging allocation churn, and smarter eviction under tight DXGI memory budgets.
-4. **Shader Recompiler & DXIL Passes (`crates/victory-shader`):**
-   - Tighter Wave64-on-Wave32 lowering, eliminating redundant lane/waterfall operations, and faster pipeline compilation.
+1. **RT Global Illumination & BVH Traversal (`crates/victory-shader/src/emit/intersect.rs`, `crates/victory-gpu/src/memory.rs`, `pipeline/rt_gi.rs`)**
+2. **Submission Prep & Indirect Execution (`crates/victory-gpu/src/draw.rs`, `indirect.rs`, `host.rs`)**
+3. **8 GB VRAM Residency & Texture Streaming (`crates/victory-gpu/src/texture.rs`, `pool.rs`, `residency.rs`)**
+4. **Wave32 / DXIL Shader Recompiler Passes (`crates/victory-shader`)**
 
 Before opening a PR, please verify:
-- `cargo test --workspace` passes.
-- `cargo run -p xtask -- policy` passes with zero violations (strict zero-game-asset rule).
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` passes.
+- `cargo test --workspace --locked` passes.
+- `cargo run -p xtask -- policy` passes with zero violations.
 
 ---
 
 ## Credits & License
 
-- Built on upstream open-source work:
-  - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and contributors (`GPL-3.0-or-later`)
-  - **[XCL](https://github.com/ivall/xcl)** by ivall and contributors (`GPL-2.0-only` references rewritten in Rust)
-  - Community contributions from `victory-amd` and fork contributors
-- Licensed under **GPL-3.0-or-later**. See [LICENSE](LICENSE).
+Built on upstream open-source work:
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and contributors (`GPL-3.0-or-later`)
+- **[codec-d/cool_fox](https://github.com/codec-d/cool_fox)** (CGBJ) Pareto residency, multi-threaded submission, and BVH ray-tracing foundation
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**, **[DexNom/VIctory](https://github.com/DexNom/VIctory)**, **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**, **[myokex/victory-amd](https://github.com/myokex/victory-amd)**, and **[XCL](https://github.com/ivall/xcl)**
+- Community contributors (`POMXARK`, `bdycounter-sudo`, `Geckomacabre`, `romainhedouin`, and fork contributors)
+
+Licensed under **GPL-3.0-or-later**. See [LICENSE](LICENSE) and [docs/asset-policy.md](docs/asset-policy.md).

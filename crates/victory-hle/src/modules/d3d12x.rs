@@ -9,9 +9,6 @@ use victory_gpu::object::{HRESULT, Iid, Object};
 
 use crate::{HleExport, HleModule};
 
-#[cfg(windows)]
-pub use victory_gpu::pipeline::prepare_shader_warmup;
-
 /// Device creation; first hands the device the title's general allocator
 /// (`XMemAlloc`, which honours the title's hooks) for resource memory.
 extern "system" fn create_device(
@@ -22,13 +19,9 @@ extern "system" fn create_device(
 ) -> HRESULT {
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
+    victory_gpu::resource::use_many_page_mapper(super::xmem::map_aliases);
     #[cfg(windows)]
-    {
-        victory_gpu::on_failure(host_gpu_failed);
-        // A crash in the host driver's shader compiler names only the
-        // driver: the crash log also says which pipelines were being made.
-        victory_loader::note_on_crash(victory_gpu::pipeline::crash_note);
-    }
+    victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)
 }
 
@@ -44,11 +37,26 @@ fn host_gpu_failed(what: &str) -> ! {
     unreachable!("the process has ended")
 }
 
-/// The offline warm-up: see `victory_gpu::shader_cache::warm`.
+/// Translates `container` into the cache ([`use_shader_cache`]) ahead of
+/// any run: whether it was there already, or why it does not translate.
+pub fn precompile(container: &[u8]) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::precompile(container)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        Err("no host".into())
+    }
+}
+
+/// The fork's offline warm-up (`victory translate --warm`), by
+/// [`precompile`]: whether it was translated now.
 pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     #[cfg(windows)]
     {
-        victory_gpu::shader_cache::warm(container)
+        victory_gpu::shader_cache::precompile(container).map(|was_there| !was_there)
     }
     #[cfg(not(windows))]
     {

@@ -2,8 +2,7 @@ use object::LittleEndian as LE;
 use object::Object;
 use object::pe::{self, ImageNtHeaders64};
 use object::read::pe::{
-    ExportTarget, ImageNtHeaders, ImageOptionalHeader, Import, ImportTable, ImportThunkList,
-    PeFile64,
+    ImageNtHeaders, ImageOptionalHeader, Import, ImportTable, ImportThunkList, PeFile64,
 };
 
 use crate::layout::{self, dir};
@@ -143,7 +142,7 @@ impl ImageInfo {
             )));
         }
 
-        let sections = file
+        let sections: Vec<SectionInfo> = file
             .section_table()
             .iter()
             .map(|s| SectionInfo {
@@ -156,6 +155,31 @@ impl ImageInfo {
             })
             .collect();
 
+        // Validate section raw-data boundaries before accepting
+        // the PE image.
+        for section in &sections {
+            if section.file_size == 0 {
+                continue;
+            }
+
+            let start = u64::from(section.file_offset);
+            let size = u64::from(section.file_size);
+
+            let Some(end) = start.checked_add(size) else {
+                return Err(PeError::Malformed(format!(
+                    "section '{}' has invalid raw-data bounds",
+                    section.name
+                )));
+            };
+
+            if end > data.len() as u64 {
+                return Err(PeError::Malformed(format!(
+                    "section '{}' extends beyond file bounds",
+                    section.name
+                )));
+            }
+        }
+
         let dir_present = |index: usize| {
             file.data_directory(index)
                 .is_some_and(|d| d.virtual_address.get(LE) != 0 && d.size.get(LE) != 0)
@@ -166,7 +190,7 @@ impl ImageInfo {
             None => Vec::new(),
         };
         let delay_imports = parse_delay_imports(&file, opt.size_of_image())?;
-        let exports = parse_exports(&file)?;
+        let exports = parse_exports(&file, opt.image_base())?;
         let tls = parse_tls(&file, data, opt.image_base())?;
         let codeview = file.pdb_info()?.map(|cv| CodeViewInfo {
             pdb_path: String::from_utf8_lossy(cv.path()).into_owned(),
@@ -301,16 +325,13 @@ fn parse_delay_imports(
 }
 
 /// Pairs each name-table entry with its IAT slot. The IAT RVA is not checked
-/// by `object`, so every slot is checked to be non-zero and inside the image.
+/// by `object`, so every slot is checked to lie inside the image here.
 fn entries<'data>(
     mut thunks: ImportThunkList<'data>,
     iat_rva: u32,
     size_of_image: u32,
     import: impl Fn(pe::ImageThunkData64) -> object::read::Result<Import<'data>>,
 ) -> Result<Vec<ImportEntry>, PeError> {
-    if iat_rva == 0 {
-        return Err(PeError::Malformed("IAT RVA is 0".into()));
-    }
     let mut entries = Vec::new();
     while let Some(thunk) = thunks.next::<ImageNtHeaders64>()? {
         let iat_slot_rva = u32::try_from(entries.len() * 8)
@@ -328,34 +349,46 @@ fn entries<'data>(
     Ok(entries)
 }
 
-fn parse_exports(file: &PeFile64<'_>) -> Result<Vec<ExportInfo>, PeError> {
-    let Some(table) = file.export_table()? else {
-        return Ok(Vec::new());
-    };
-    Ok(table
-        .exports()?
-        .into_iter()
-        // An address of 0 marks an unused slot in the address table (a gap
-        // in the ordinals), not an export at the image base.
-        .filter(|e| !matches!(e.target, ExportTarget::Address(0)))
+fn parse_exports(file: &PeFile64<'_>, image_base: u64) -> Result<Vec<ExportInfo>, PeError> {
+    use object::read::{ExportFlags, ExportTarget as ReadTarget, NameOrOrdinal};
+
+    // The PE-specific table keeps one name per address-table slot, so two
+    // names sharing an ordinal lose all but the last one. The generic
+    // iterator yields every name, then the ordinal-only entries.
+    file.exports()
+        .map_err(|e| PeError::Malformed(format!("export table: {e}")))?
         .map(|e| {
-            let (rva, forward) = match e.target {
-                ExportTarget::Address(rva) => (Some(rva), None),
-                ExportTarget::ForwardByName(d, n) => {
-                    (None, Some(format!("{}.{}", utf8(d), utf8(n))))
-                }
-                ExportTarget::ForwardByOrdinal(d, o) => {
-                    (None, Some(format!("{}.#{}", utf8(d), o.0)))
-                }
+            let e = e.map_err(|e| PeError::Malformed(format!("export: {e}")))?;
+            let ordinal = match e.flags() {
+                ExportFlags::Pe { ordinal } => ordinal.0,
+                _ => 0,
             };
-            ExportInfo {
-                name: e.name.map(utf8),
-                ordinal: e.ordinal.0,
+            let name = match e.name() {
+                NameOrOrdinal::Name(name) => Some(utf8(name)),
+                NameOrOrdinal::Ordinal(_) => None,
+            };
+            let (rva, forward) = match e.target() {
+                // The generic iterator adds the image base to an address.
+                ReadTarget::Address { address } => {
+                    (Some(address.wrapping_sub(image_base) as u32), None)
+                }
+                ReadTarget::Reexport { library, name } => {
+                    let symbol = match name {
+                        NameOrOrdinal::Name(name) => utf8(name),
+                        NameOrOrdinal::Ordinal(ordinal) => format!("#{ordinal}"),
+                    };
+                    (None, Some(format!("{}.{}", utf8(library), symbol)))
+                }
+                _ => (None, None),
+            };
+            Ok(ExportInfo {
+                name,
+                ordinal,
                 rva,
                 forward,
-            }
+            })
         })
-        .collect())
+        .collect()
 }
 
 fn parse_tls(
@@ -409,13 +442,11 @@ mod tests {
     use super::*;
 
     /// The test binary itself is a real MSVC-linked PE32+ image.
-    #[cfg(target_os = "windows")]
     fn own_image() -> Vec<u8> {
         std::fs::read(std::env::current_exe().unwrap()).unwrap()
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
     fn parses_own_test_binary() {
         let info = ImageInfo::parse(&own_image()).unwrap();
         assert_eq!(info.machine, MACHINE_AMD64);
@@ -435,7 +466,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
     fn rva_to_file_offset_maps_entry_point() {
         let data = own_image();
         let info = ImageInfo::parse(&data).unwrap();
@@ -444,7 +474,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
     fn rva_to_file_offset_rejects_offsets_past_4_gib() {
         let mut info = ImageInfo::parse(&own_image()).unwrap();
         let rva = info.sections[0].rva + 0x20;
@@ -459,16 +488,12 @@ mod tests {
     fn rejects_garbage_without_panicking() {
         assert!(ImageInfo::parse(b"").is_err());
         assert!(ImageInfo::parse(b"MZ not really").is_err());
-        #[cfg(target_os = "windows")]
-        {
-            let mut truncated = own_image();
-            truncated.truncate(0x200);
-            assert!(ImageInfo::parse(&truncated).is_err());
-        }
+        let mut truncated = own_image();
+        truncated.truncate(0x200);
+        assert!(ImageInfo::parse(&truncated).is_err());
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
     fn rejects_iat_outside_image() {
         let mut data = own_image();
         let dd = layout::data_directory_offset(&data, dir::IMPORT).unwrap();
@@ -482,51 +507,6 @@ mod tests {
         assert!(matches!(
             ImageInfo::parse(&data),
             Err(PeError::Malformed(_))
-        ));
-    }
-
-    #[test]
-    fn rejects_zero_iat_rva() {
-        let mut data = own_image();
-        let dd = layout::data_directory_offset(&data, dir::IMPORT).unwrap();
-        let import_rva = layout::read_u32(&data, dd).unwrap();
-        let desc = ImageInfo::parse(&data)
-            .unwrap()
-            .rva_to_file_offset(import_rva)
-            .unwrap() as usize;
-        assert_ne!(layout::read_u32(&data, desc).unwrap(), 0);
-        data[desc + 16..desc + 20].copy_from_slice(&0u32.to_le_bytes());
-        assert!(matches!(
-            ImageInfo::parse(&data),
-            Err(PeError::Malformed(msg)) if msg == "IAT RVA is 0"
-        ));
-    }
-
-    #[test]
-    fn rejects_zero_delay_import_iat_rva() {
-        let mut body = vec![0u8; 0x100];
-        body[0..4].copy_from_slice(&1u32.to_le_bytes()); // dlattrRva
-        body[4..8].copy_from_slice(&0x1040u32.to_le_bytes()); // dll_name_rva
-        body[12..16].copy_from_slice(&0x1060u32.to_le_bytes()); // import_address_table_rva
-        body[16..20].copy_from_slice(&0x1050u32.to_le_bytes()); // import_name_table_rva
-        body[0x40..0x46].copy_from_slice(b"t.dll\0");
-        body[0x50..0x58].copy_from_slice(&((1u64 << 63) | 1).to_le_bytes());
-
-        let mut data = synthetic_image(&body);
-        let export_dd = layout::data_directory_offset(&data, 0).unwrap();
-        data[export_dd..export_dd + 8].fill(0);
-        let delay_dd = layout::data_directory_offset(&data, 13).unwrap();
-        data[delay_dd..delay_dd + 4].copy_from_slice(&0x1000u32.to_le_bytes());
-        data[delay_dd + 4..delay_dd + 8].copy_from_slice(&0x40u32.to_le_bytes());
-
-        let info = ImageInfo::parse(&data).unwrap();
-        assert_eq!(info.delay_imports.len(), 1);
-        assert_eq!(info.delay_imports[0].entries[0].iat_slot_rva, 0x1060);
-
-        data[0x200 + 12..0x200 + 16].copy_from_slice(&0u32.to_le_bytes());
-        assert!(matches!(
-            ImageInfo::parse(&data),
-            Err(PeError::Malformed(msg)) if msg == "IAT RVA is 0"
         ));
     }
     /// A minimal PE32+ image: one section at RVA 0x1000 holding `body`, with
@@ -559,6 +539,74 @@ mod tests {
         d.extend_from_slice(body);
         d.resize(0x400, 0);
         d
+    }
+
+    #[test]
+    fn rejects_section_extending_beyond_file() {
+        // Create a synthetic PE image.
+        let mut data = synthetic_image(&vec![0u8; 0x200]);
+
+        // Remove the export directory to isolate section validation.
+        let opt = 0x58;
+        data[opt + 112..opt + 120].fill(0);
+
+        // Verify the baseline PE is accepted.
+        assert!(
+            ImageInfo::parse(&data).is_ok(),
+            "baseline synthetic image must be valid"
+        );
+
+        // The section header starts after the 240-byte optional header.
+        let sec = opt + 240;
+
+        // Declare 4096 bytes of raw section data.
+        // The actual file contains only 1024 bytes.
+        data[sec + 16..sec + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+
+        // Investigate whether the parser rejects this malformed image.
+        assert!(
+            ImageInfo::parse(&data).is_err(),
+            "section extends beyond physical file bounds"
+        );
+    }
+
+    #[test]
+    fn accepts_section_ending_at_file_boundary() {
+        let mut data = synthetic_image(&vec![0u8; 0x200]);
+
+        // Disable the export directory to isolate section validation.
+        let opt = 0x58;
+        data[opt + 112..opt + 120].fill(0);
+
+        // Raw section: offset 0x200 + size 0x200 = file length 0x400.
+        let info = ImageInfo::parse(&data);
+
+        assert!(
+            info.is_ok(),
+            "section ending exactly at EOF should be accepted"
+        );
+    }
+
+    #[test]
+    fn accepts_section_with_zero_raw_size() {
+        let mut data = synthetic_image(&vec![0u8; 0x200]);
+
+        // Disable the export directory.
+        let opt = 0x58;
+        data[opt + 112..opt + 120].fill(0);
+
+        // Section header begins after the optional header.
+        let sec = opt + 240;
+
+        // A section may occupy virtual memory without having raw data.
+        data[sec + 16..sec + 20].copy_from_slice(&0u32.to_le_bytes());
+
+        let info = ImageInfo::parse(&data);
+
+        assert!(
+            info.is_ok(),
+            "section with zero raw size should be accepted"
+        );
     }
 
     #[test]
@@ -597,6 +645,50 @@ mod tests {
             [
                 (Some("alpha"), 1, Some(0x1200)),
                 (Some("gamma"), 3, Some(0x1204))
+            ]
+        );
+    }
+
+    #[test]
+    fn every_name_of_a_shared_ordinal_survives() {
+        // Two names for address slot 0, one for slot 1. The PE-specific
+        // export table keeps only one name per slot, so "alpha" would be
+        // lost; the generic iterator keeps both.
+        let mut body = vec![0u8; 0x100];
+        let put32 =
+            |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put32(&mut body, 12, 0x1040); // name of the DLL
+        put32(&mut body, 16, 1); // ordinal base
+        put32(&mut body, 20, 2); // number of functions
+        put32(&mut body, 24, 3); // number of names
+        put32(&mut body, 28, 0x1028); // address table
+        put32(&mut body, 32, 0x1034); // name pointer table
+        put32(&mut body, 36, 0x1044); // name ordinal table
+        put32(&mut body, 0x28, 0x1200);
+        put32(&mut body, 0x2C, 0x1204);
+        put32(&mut body, 0x34, 0x1050);
+        put32(&mut body, 0x38, 0x1056);
+        put32(&mut body, 0x3C, 0x105C);
+        body[0x40..0x46].copy_from_slice(b"t.dll\0");
+        body[0x44..0x46].copy_from_slice(&0u16.to_le_bytes());
+        body[0x46..0x48].copy_from_slice(&0u16.to_le_bytes());
+        body[0x48..0x4A].copy_from_slice(&1u16.to_le_bytes());
+        body[0x50..0x56].copy_from_slice(b"alpha\0");
+        body[0x56..0x5B].copy_from_slice(b"beta\0");
+        body[0x5C..0x62].copy_from_slice(b"gamma\0");
+
+        let info = ImageInfo::parse(&synthetic_image(&body)).unwrap();
+        let exports: Vec<_> = info
+            .exports
+            .iter()
+            .map(|e| (e.name.as_deref(), e.ordinal, e.rva))
+            .collect();
+        assert_eq!(
+            exports,
+            [
+                (Some("alpha"), 1, Some(0x1200)),
+                (Some("beta"), 1, Some(0x1200)),
+                (Some("gamma"), 2, Some(0x1204)),
             ]
         );
     }

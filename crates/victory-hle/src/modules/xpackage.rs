@@ -136,6 +136,7 @@ extern "system" fn register_progress(
     put(out, token())
 }
 
+/// The completed installation has no pending progress callbacks to wait for.
 extern "system" fn unregister_progress(
     _: This,
     _monitor: *const c_void,
@@ -326,6 +327,34 @@ mod tests {
     use crate::modules::xgameruntime::method;
 
     #[test]
+    fn completed_installation_unregisters_progress_immediately() {
+        type Register =
+            extern "system" fn(This, *const c_void, *mut c_void, *const c_void, *mut u64) -> HRESULT;
+        type Unregister = extern "system" fn(This, *const c_void, u64, bool) -> bool;
+        extern "system" fn callback(_: *mut c_void, _: *const c_void) {}
+
+        let this: This = &OBJECT;
+        let register = method::<Register>(&OBJECT, 0x48);
+        assert_eq!(VTABLE.0[0x50 / 8], unregister_progress as *const ());
+        let unregister = method::<Unregister>(&OBJECT, 0x50);
+        for wait in [false, true] {
+            let mut token = 0;
+            assert_eq!(
+                register(
+                    this,
+                    monitor(),
+                    std::ptr::null_mut(),
+                    callback as *const c_void,
+                    &mut token
+                ),
+                S_OK
+            );
+            assert_ne!(token, 0);
+            assert!(unregister(this, monitor(), token, wait));
+        }
+    }
+
+    #[test]
     fn the_installation_is_complete_and_alone() {
         let this: This = &OBJECT;
         type Id = extern "system" fn(This, usize, *mut u8) -> HRESULT;
@@ -376,28 +405,5 @@ mod tests {
             S_OK
         );
         assert_eq!(xasync::XAsyncGetStatus(&mut block, true), NO_PACKAGE);
-
-        // Progress registration and its paired bool-returning unregistration (0x48 / 0x50).
-        type Register = extern "system" fn(
-            This,
-            *const c_void,
-            *mut c_void,
-            *const c_void,
-            *mut u64,
-        ) -> HRESULT;
-        type Unregister = extern "system" fn(This, *const c_void, u64, bool) -> bool;
-        let mut tok = 0u64;
-        assert_eq!(
-            method::<Register>(&OBJECT, 0x48)(
-                this,
-                monitor(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                &mut tok,
-            ),
-            S_OK
-        );
-        assert_ne!(tok, 0);
-        assert!(method::<Unregister>(&OBJECT, 0x50)(this, monitor(), tok, true));
     }
 }

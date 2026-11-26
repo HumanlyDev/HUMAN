@@ -135,7 +135,9 @@ fn valid_container(name: &str) -> bool {
 /// A committed version of a container.
 struct Version {
     dir: PathBuf,
-    number: u64,
+    /// The highest version number any entry in the container's folder
+    /// carries, readable or not; the next commit goes above it.
+    highest: u64,
     name: String,
     display: String,
     /// Blob names; blob `i` is the file `i`.
@@ -177,38 +179,73 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
     (out.len() >= 2).then_some(out)
 }
 
-/// The container's newest committed version, if any. Removes what a crash
-/// left: unfinished versions and older ones.
+/// The number of a version folder exactly as [`commit`] names it (`v1`,
+/// `v2`, ...); `None` for anything else, such as `v01`, `v+1` or `v0`.
+fn version_number(file: &str) -> Option<u64> {
+    let n = file.strip_prefix('v')?.parse::<u64>().ok()?;
+    (n > 0 && format!("v{n}") == file).then_some(n)
+}
+
+/// The names in version folder `dir`: container, display, blobs; `None` if
+/// its manifest is missing or does not parse.
+fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
+    let bytes = match std::fs::read(dir.join(MANIFEST)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let Some(mut names) = parse_manifest(&bytes) else {
+        return Ok(None);
+    };
+    let blobs = names.split_off(2);
+    let [name, display] = <[String; 2]>::try_from(names).expect("two names, checked by the parser");
+    Ok(Some((name, display, blobs)))
+}
+
+/// The container's newest readable committed version, if any. Removes what
+/// a crash left: unfinished versions, and versions older than that one.
+/// An unreadable newer folder (a stray, or a broken manifest) is neither
+/// taken nor removed, and never costs the version below it.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut committed = Vec::new();
+    let mut highest = 0;
     for entry in std::fs::read_dir(dir)?.flatten() {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
             std::fs::remove_dir_all(entry.path())?;
-        } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
-            committed.push(n);
+        } else if let Some(n) = version_number(&file) {
+            highest = highest.max(n);
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                committed.push(n);
+            }
         }
     }
-    committed.sort_unstable();
-    let Some(&number) = committed.last() else {
+    committed.sort_unstable_by(|a, b| b.cmp(a));
+    if committed.is_empty() {
         return Ok(None);
-    };
-    for old in &committed[..committed.len() - 1] {
-        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
     }
-    let version = dir.join(format!("v{number}"));
-    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
-    let mut names = parse_manifest(&std::fs::read(version.join(MANIFEST))?).ok_or_else(bad)?;
-    let blobs = names.split_off(2);
-    let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
-    Ok(Some(Version {
-        dir: version,
-        number,
-        name,
-        display,
-        blobs,
-    }))
+    for (at, &number) in committed.iter().enumerate() {
+        let version = dir.join(format!("v{number}"));
+        let Some((name, display, blobs)) = load(&version)? else {
+            continue;
+        };
+        for old in &committed[at + 1..] {
+            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+        }
+        return Ok(Some(Version {
+            dir: version,
+            highest,
+            name,
+            display,
+            blobs,
+        }));
+    }
+    // Versions exist but none reads: keep them all, and refuse.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "no save version has a readable manifest",
+    ))
 }
 
 /// The version of container `name` in `dir`; none for a missing container
@@ -256,8 +293,9 @@ fn commit(
         match source {
             Source::Data(data) => write(path, data)?,
             // Files are never changed in place, so sharing one is safe.
-            Source::Kept(from) => std::fs::hard_link(from, &path)
-                .or_else(|_| std::fs::copy(from, &path).map(drop))?,
+            Source::Kept(from) => {
+                std::fs::hard_link(from, &path).or_else(|_| write(path, &std::fs::read(from)?))?
+            }
         }
         step();
     }
@@ -272,57 +310,23 @@ fn commit(
 /// The containers under a provider's root, by exact name; containers in
 /// the old one-file-per-blob layout are converted first.
 fn containers(root: &Path) -> Vec<(String, PathBuf)> {
-    scan_containers(root, |_, _| {})
-}
-
-fn scan_containers(
-    root: &Path,
-    mut scan_failed: impl FnMut(Option<&str>, std::io::Error),
-) -> Vec<(String, PathBuf)> {
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) => {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                scan_failed(None, error);
-            }
-            return Vec::new();
-        }
-    };
     let mut out = Vec::new();
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                scan_failed(None, error);
-                continue;
-            }
-        };
+    for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
         let path = entry.path();
         let file = entry.file_name().to_string_lossy().into_owned();
-        let gone = file.ends_with(".gone");
-        let versioned = file.contains('~');
-        let legacy = if gone || versioned { None } else { decode(&file) };
-        match path.metadata() {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => continue,
-            Err(error) => {
-                if let Some(name) = &legacy {
-                    scan_failed(Some(name), error);
-                }
-                continue;
-            }
+        if !path.is_dir() {
+            continue;
         }
-        if gone {
+        if file.ends_with(".gone") {
             let _ = std::fs::remove_dir_all(&path);
-        } else if versioned {
+        } else if file.contains('~') {
             if let Ok(Some(v)) = current(&path) {
                 out.push((v.name, path));
             }
-        } else if let Some(name) = legacy {
-            match migrate(root, &name, &path) {
-                Ok(dir) => out.push((name, dir)),
-                Err(error) => scan_failed(Some(&name), error),
-            }
+        } else if let Some(name) = decode(&file)
+            && let Some(dir) = migrate(root, &name, &path)
+        {
+            out.push((name, dir));
         }
     }
     out.sort();
@@ -331,32 +335,33 @@ fn scan_containers(
 
 /// Moves a container of the old layout (blob files named by encoded name,
 /// a `.display` file) into a committed version, then removes it.
-fn migrate(root: &Path, name: &str, old: &Path) -> std::io::Result<PathBuf> {
+fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
     let dir = container_dir(root, name);
-    let done = current_named(&dir, name)?.is_some(); // a crash after the commit
+    let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
     if !done {
         let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
-        let mut blobs = Vec::new();
-        for entry in std::fs::read_dir(old)? {
-            let entry = entry?;
-            if let Some(blob) = entry.file_name().to_str().and_then(decode) {
-                blobs.push((blob, std::fs::read(entry.path())?));
-            }
-        }
+        let mut blobs: Vec<(String, Vec<u8>)> = std::fs::read_dir(old)
+            .ok()?
+            .flatten()
+            .filter_map(|e| {
+                let blob = decode(e.file_name().to_str()?)?;
+                Some((blob, std::fs::read(e.path()).ok()?))
+            })
+            .collect();
         blobs.sort();
         let sources: Vec<_> = blobs
             .iter()
             .map(|(n, d)| (n.as_str(), Source::Data(d)))
             .collect();
-        commit(&dir, 1, name, &display, &sources)?;
+        commit(&dir, 1, name, &display, &sources).ok()?;
     }
-    std::fs::remove_dir_all(old)?;
+    std::fs::remove_dir_all(old).ok()?;
     tracing::info!(container = name, "game save moved to the versioned layout");
-    Ok(dir)
+    Some(dir)
 }
 
-fn used_bytes(containers: &[(String, PathBuf)]) -> u64 {
-    containers
+fn used_bytes(root: &Path) -> u64 {
+    containers(root)
         .iter()
         .filter_map(|(name, dir)| current_named(dir, name).ok().flatten())
         .map(|v| v.sizes().iter().map(|(_, size)| size).sum::<u64>())
@@ -425,7 +430,7 @@ impl Provider {
 /// Quota left under a provider's root, or less if the host disk is fuller.
 fn remaining(root: &Path) -> u64 {
     QUOTA
-        .saturating_sub(used_bytes(&containers(root)))
+        .saturating_sub(used_bytes(root))
         .min(storage::disk_free(root))
 }
 
@@ -457,25 +462,11 @@ impl Update {
     /// Applies the update as one new version of the container.
     fn submit(&self) -> HRESULT {
         let _saves = saves_lock();
-        let root = self.dir.parent().unwrap_or(&self.dir);
-        // Scan before taking the update's base. An incomplete scan or a
-        // failed migration cannot establish that a new version is safe.
-        let mut scan_error = None;
-        let containers = scan_containers(root, |name, error| {
-            if name.is_none_or(|name| name == self.name) {
-                scan_error = Some(error);
-            }
-        });
         let current = match current(&self.dir) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return io_error(&self.dir, &e),
         };
-        if current.is_none()
-            && let Some(error) = scan_error
-        {
-            return io_error(&self.dir, &error);
-        }
         if current.as_ref().is_some_and(|v| v.name != self.name) {
             // Another container's name hashes alike: never mix the two.
             return NO_ACCESS;
@@ -510,13 +501,14 @@ impl Update {
             let changed = sizes.iter().filter(|(n, _)| self.changes.iter().any(|(c, _)| c == n));
             changed.map(|(_, size)| size).sum()
         });
+        let root = self.dir.parent().unwrap_or(&self.dir);
         let free = storage::disk_free(root);
-        if let Some(hr) = no_room(written as u64, replaced, used_bytes(&containers), free) {
+        if let Some(hr) = no_room(written as u64, replaced, used_bytes(root), free) {
             return hr;
         }
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
-        let number = current.as_ref().map_or(1, |v| v.number + 1);
+        let number = current.as_ref().map_or(1, |v| v.highest + 1);
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
             return io_error(&self.dir, &e);
         }
@@ -663,42 +655,6 @@ static DELETE: u8 = 0;
 static READ: u8 = 0;
 static SUBMIT: u8 = 0;
 
-fn open_at(saves: &Path, config: *const c_char) -> Result<*mut Provider, HRESULT> {
-    if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
-        return Err(NO_ACCESS);
-    }
-    Provider::open(saves, text(config).as_deref()).map(give)
-}
-
-fn remaining_quota(provider: *const Provider) -> Result<i64, HRESULT> {
-    get(provider)
-        .ok_or(E_INVALIDARG)
-        .map(|p| p.remaining() as i64)
-}
-
-fn remove_container(provider: *const Provider, name: *const c_char) -> HRESULT {
-    match (get(provider), text(name)) {
-        (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
-        (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
-        _ => E_INVALIDARG,
-    }
-}
-
-extern "system" fn initialize(
-    _: This,
-    _user: *const c_void,
-    config: *const c_char,
-    _sync_on_demand: bool,
-    out: *mut *mut Provider,
-) -> HRESULT {
-    if out.is_null() {
-        return E_INVALIDARG;
-    }
-    match open_at(&runtime::title().saves(), config) {
-        Ok(provider) => put(out, provider),
-        Err(hr) => hr,
-    }
-}
 extern "system" fn initialize_async(
     _: This,
     _user: *const c_void,
@@ -706,7 +662,12 @@ extern "system" fn initialize_async(
     _sync_on_demand: bool,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let result = open_at(&runtime::title().saves(), config).map(xasync::bytes);
+    let saves = runtime::title().saves();
+    let result = if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+        Err(NO_ACCESS)
+    } else {
+        Provider::open(&saves, text(config).as_deref()).map(|p| xasync::bytes(give(p)))
+    };
     xasync::finished_with(block, (&raw const INIT).cast(), result)
 }
 extern "system" fn initialize_result(
@@ -720,41 +681,31 @@ extern "system" fn close_provider(_: This, provider: *mut Provider) {
     take(provider);
 }
 
-extern "system" fn quota(_: This, provider: *const Provider, out: *mut i64) -> HRESULT {
-    if out.is_null() {
-        return E_INVALIDARG;
-    }
-    match remaining_quota(provider) {
-        Ok(bytes) => put(out, bytes),
-        Err(hr) => hr,
-    }
-}
 extern "system" fn quota_async(
     _: This,
     provider: *const Provider,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let result = remaining_quota(provider).map(xasync::bytes);
+    let result = get(provider)
+        .ok_or(E_INVALIDARG)
+        .map(|p| xasync::bytes(p.remaining() as i64));
     xasync::finished_with(block, (&raw const QUOTA_CALL).cast(), result)
 }
 extern "system" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) -> HRESULT {
     xasync::result(block, (&raw const QUOTA_CALL).cast(), out)
 }
 
-extern "system" fn delete_container(
-    _: This,
-    provider: *const Provider,
-    name: *const c_char,
-) -> HRESULT {
-    remove_container(provider, name)
-}
 extern "system" fn delete_async(
     _: This,
     provider: *const Provider,
     name: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let hr = remove_container(provider, name);
+    let hr = match (get(provider), text(name)) {
+        (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
+        (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
+        _ => E_INVALIDARG,
+    };
     xasync::finished(block, (&raw const DELETE).cast(), hr)
 }
 extern "system" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
@@ -782,26 +733,15 @@ extern "system" fn container_info(
 }
 
 extern "system" fn enumerate_containers(
-    this: This,
-    provider: *const Provider,
-    context: *mut c_void,
-    callback: Option<ContainerCallback>,
-) -> HRESULT {
-    enumerate_containers_by_name(this, provider, std::ptr::null(), context, callback)
-}
-
-extern "system" fn enumerate_containers_by_name(
     _: This,
     provider: *const Provider,
-    prefix: *const c_char,
     context: *mut c_void,
     callback: Option<ContainerCallback>,
 ) -> HRESULT {
     let (Some(p), Some(callback)) = (get(provider), callback) else {
         return E_INVALIDARG;
     };
-    let prefix = text(prefix).unwrap_or_default();
-    report(&p.root, |n| n.starts_with(&prefix), context, callback);
+    report(&p.root, |_| true, context, callback);
     S_OK
 }
 
@@ -822,15 +762,6 @@ extern "system" fn create_container(
 }
 extern "system" fn close_container(_: This, container: *mut Container) {
     take(container);
-}
-
-extern "system" fn enumerate_all_blobs(
-    this: This,
-    container: *const Container,
-    context: *mut c_void,
-    callback: Option<BlobCallback>,
-) -> HRESULT {
-    enumerate_blobs(this, container, std::ptr::null(), context, callback)
 }
 
 extern "system" fn enumerate_blobs(
@@ -1000,10 +931,6 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
     }
 }
 
-extern "system" fn submit(_: This, update: *const Update) -> HRESULT {
-    get(update).map_or(E_INVALIDARG, Update::submit)
-}
-
 extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
     let hr = get(update).map_or(E_INVALIDARG, Update::submit);
     xasync::finished(block, (&raw const SUBMIT).cast(), hr)
@@ -1017,33 +944,33 @@ static VTABLE: Methods<30> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    initialize as *const (),                   // 0x18
-    initialize_async as *const (),             // 0x20
-    initialize_result as *const (),            // 0x28
-    close_provider as *const (),               // 0x30
-    quota as *const (),                        // 0x38
-    quota_async as *const (),                  // 0x40
-    quota_result as *const (),                 // 0x48
-    delete_container as *const (),             // 0x50
-    delete_async as *const (),                 // 0x58
-    delete_result as *const (),                // 0x60
-    container_info as *const (),               // 0x68
-    enumerate_containers as *const (),         // 0x70
-    enumerate_containers_by_name as *const (), // 0x78
-    create_container as *const (),             // 0x80
-    close_container as *const (),              // 0x88
-    enumerate_all_blobs as *const (),          // 0x90
-    enumerate_blobs as *const (),              // 0x98 by name prefix
-    read_blobs as *const (),                   // 0xa0
-    read_async as *const (),                   // 0xa8
-    read_result as *const (),                  // 0xb0
-    create_update as *const (),                // 0xb8
-    close_update as *const (),                 // 0xc0
-    write_blob as *const (),                   // 0xc8
-    delete_blob as *const (),                  // 0xd0
-    submit as *const (),                       // 0xd8
-    submit_async as *const (),                 // 0xe0
-    submit_result as *const (),                // 0xe8
+    missing::<3> as *const (),         // 0x18 initialize (blocking)
+    initialize_async as *const (),     // 0x20
+    initialize_result as *const (),    // 0x28
+    close_provider as *const (),       // 0x30
+    missing::<7> as *const (),         // 0x38 remaining quota (blocking)
+    quota_async as *const (),          // 0x40
+    quota_result as *const (),         // 0x48
+    missing::<10> as *const (),        // 0x50 delete (blocking)
+    delete_async as *const (),         // 0x58
+    delete_result as *const (),        // 0x60
+    container_info as *const (),       // 0x68
+    enumerate_containers as *const (), // 0x70
+    missing::<15> as *const (),        // 0x78 by name prefix
+    create_container as *const (),     // 0x80
+    close_container as *const (),      // 0x88
+    missing::<18> as *const (),        // 0x90 all blob info
+    enumerate_blobs as *const (),      // 0x98 by name prefix
+    read_blobs as *const (),           // 0xa0
+    read_async as *const (),           // 0xa8
+    read_result as *const (),          // 0xb0
+    create_update as *const (),        // 0xb8
+    close_update as *const (),         // 0xc0
+    write_blob as *const (),           // 0xc8
+    delete_blob as *const (),          // 0xd0
+    missing::<27> as *const (),        // 0xd8 submit (blocking)
+    submit_async as *const (),         // 0xe0
+    submit_result as *const (),        // 0xe8
 ]);
 
 #[cfg(test)]
@@ -1180,6 +1107,37 @@ mod tests {
         }
     }
 
+    /// A kept blob that cannot be hard-linked (NTFS allows 1024 links to a
+    /// file) is copied into the new version with its exact bytes.
+    #[cfg(windows)]
+    #[test]
+    fn a_kept_blob_past_the_link_limit_is_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        const NTFS: &str = "the temp folder must be on NTFS, which allows 1024 links to a file";
+        let old_b = container_dir(root, "Slot").join("v1").join("1");
+        for i in 0..1023 {
+            std::fs::hard_link(&old_b, links.path().join(i.to_string())).expect(NTFS);
+        }
+        let full = std::fs::hard_link(&old_b, links.path().join("full")).expect_err(NTFS);
+        assert_eq!(full.kind(), std::io::ErrorKind::TooManyLinks, "{NTFS}");
+
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
+
+        let new = (
+            "two".into(),
+            vec![("a".into(), "new a".into()), ("b".into(), "old b".into())],
+        );
+        assert_eq!(state(root), Some(new));
+        assert!(!old_b.exists());
+        assert_eq!(std::fs::read(links.path().join("0")).unwrap(), b"old b");
+    }
+
     #[test]
     fn names_are_exact() {
         for name in ["Save_1", "slot/2", "a.b c%", "\u{e9}t\u{e9}"] {
@@ -1251,120 +1209,7 @@ mod tests {
             ]
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
-        assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
-    }
-
-    #[test]
-    fn the_old_layout_retries_unreadable_blobs() {
-        let saves = tempfile::tempdir().unwrap();
-        let root = saves
-            .path()
-            .join(format!("{:016X}", xuser::XUID))
-            .join("scid");
-        let old = root.join("Player");
-        let header = old.join("Save%20Header");
-        // A directory at the blob path makes reading it fail on any host.
-        std::fs::create_dir_all(&header).unwrap();
-        std::fs::write(old.join("Data"), b"data").unwrap();
-        std::fs::create_dir(old.join("bad%XX")).unwrap();
-        std::fs::create_dir(old.join("Data.new")).unwrap();
-        std::fs::create_dir(old.join(".display")).unwrap();
-        assert!(std::fs::read(&header).is_err());
-
-        let p = Provider::open(saves.path(), Some("scid")).unwrap();
-        let c = p.container("Player");
-        assert!(!c.dir.exists(), "migration committed a partial save");
-        assert_eq!(std::fs::read(old.join("Data")).unwrap(), b"data");
-        assert!(header.is_dir());
-
-        std::fs::remove_dir(&header).unwrap();
-        std::fs::write(&header, b"header").unwrap();
-        assert_eq!(containers(&root), [("Player".into(), c.dir.clone())]);
-        assert!(!old.exists());
-        assert_eq!(
-            read(&c, None).unwrap(),
-            [
-                ("Data".into(), b"data".to_vec()),
-                ("Save Header".into(), b"header".to_vec())
-            ]
-        );
-        let v = current_named(&c.dir, "Player").unwrap().unwrap();
-        assert_eq!((v.number, v.display.as_str()), (1, ""));
-    }
-
-    #[test]
-    fn a_pending_legacy_migration_blocks_updates() {
-        let saves = tempfile::tempdir().unwrap();
-        let root = saves
-            .path()
-            .join(format!("{:016X}", xuser::XUID))
-            .join("scid");
-        let old = root.join("%50layer"); // another encoded spelling of Player
-        let header = old.join("Header");
-        std::fs::create_dir_all(&header).unwrap();
-        std::fs::write(old.join("Data"), b"old data").unwrap();
-
-        let p = Provider::open(saves.path(), Some("scid")).unwrap();
-        let c = p.container("Player");
-        let update = Update {
-            name: c.name.clone(),
-            dir: c.dir.clone(),
-            display: None,
-            changes: vec![("Data".into(), Some(b"new data".to_vec()))],
-        };
-        assert_eq!(update.submit(), NO_ACCESS);
-        assert!(!c.dir.exists());
-        assert_eq!(std::fs::read(old.join("Data")).unwrap(), b"old data");
-        assert!(header.is_dir());
-
-        std::fs::remove_dir(&header).unwrap();
-        std::fs::write(&header, b"header").unwrap();
-        assert_eq!(update.submit(), S_OK);
-        assert!(!old.exists());
-        assert_eq!(
-            read(&c, None).unwrap(),
-            [
-                ("Data".into(), b"new data".to_vec()),
-                ("Header".into(), b"header".to_vec())
-            ]
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn an_unlistable_provider_root_blocks_a_new_version() {
-        let saves = tempfile::tempdir().unwrap();
-        let p = Provider::open(saves.path(), Some("scid")).unwrap();
-        let old = p.root.join("Player");
-        std::fs::create_dir(&old).unwrap();
-        std::fs::write(old.join("Header"), b"legacy header").unwrap();
-        let c = p.container("Player");
-        let update = Update {
-            name: c.name.clone(),
-            dir: c.dir.clone(),
-            display: None,
-            changes: vec![("Data".into(), Some(b"new data".to_vec()))],
-        };
-
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&p.root, std::fs::Permissions::from_mode(0o300)).unwrap();
-        let denied = std::fs::read_dir(&p.root).err().map(|error| error.kind());
-        let result = update.submit();
-        std::fs::set_permissions(&p.root, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-        assert_eq!(denied, Some(std::io::ErrorKind::PermissionDenied));
-        assert_eq!(result, NO_ACCESS);
-        assert!(!c.dir.exists());
-        assert_eq!(std::fs::read(old.join("Header")).unwrap(), b"legacy header");
-        assert_eq!(update.submit(), S_OK);
-        assert!(!old.exists());
-        assert_eq!(
-            read(&c, None).unwrap(),
-            [
-                ("Data".into(), b"new data".to_vec()),
-                ("Header".into(), b"legacy header".to_vec())
-            ]
-        );
+        assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
     }
 
     /// An empty configuration id names none. As a folder name it would be
@@ -1577,198 +1422,71 @@ mod tests {
         close_provider(this, provider);
     }
 
+    /// Only `v<N>` as `commit` writes it is a version: `v01` and the like
+    /// are neither read, counted nor removed (#870).
     #[test]
-    fn blocking_and_prefix_methods_work() {
-        let this: This = &OBJECT;
-        type Init = extern "system" fn(
-            This,
-            *const c_void,
-            *const c_char,
-            bool,
-            *mut *mut Provider,
-        ) -> HRESULT;
-        type Quota = extern "system" fn(This, *const Provider, *mut i64) -> HRESULT;
-        type DeleteContainer = extern "system" fn(This, *const Provider, *const c_char) -> HRESULT;
-        type ByName = extern "system" fn(
-            This,
-            *const Provider,
-            *const c_char,
-            *mut c_void,
-            Option<ContainerCallback>,
-        ) -> HRESULT;
-        type AllBlobs = extern "system" fn(
-            This,
-            *const Container,
-            *mut c_void,
-            Option<BlobCallback>,
-        ) -> HRESULT;
-        type Create = extern "system" fn(
-            This,
-            *const Provider,
-            *const c_char,
-            *mut *mut Container,
-        ) -> HRESULT;
-        type Update_ =
-            extern "system" fn(This, *const Container, *const c_char, *mut *mut Update) -> HRESULT;
-        type Write =
-            extern "system" fn(This, *mut Update, *const c_char, *const u8, usize) -> HRESULT;
-        type Submit = extern "system" fn(This, *const Update) -> HRESULT;
-
-        let init = method::<Init>(&OBJECT, 0x18);
-        assert_eq!(
-            init(this, std::ptr::null(), c"scid".as_ptr(), false, std::ptr::null_mut()),
-            E_INVALIDARG
-        );
-        assert_eq!(open_at(Path::new(""), c"scid".as_ptr()).err(), Some(NO_ACCESS));
-
-        let saves = tempfile::tempdir().unwrap();
-        let provider = open_at(saves.path(), c"scid".as_ptr()).unwrap();
-        let create = method::<Create>(&OBJECT, 0x80);
-        let begin_update = method::<Update_>(&OBJECT, 0xb8);
-        let write = method::<Write>(&OBJECT, 0xc8);
-        let submit_now = method::<Submit>(&OBJECT, 0xd8);
-        assert_eq!(submit_now(this, std::ptr::null()), E_INVALIDARG);
-
-        for (cname, disp, blobs) in [
-            (
-                c"Slot_1",
-                c"First",
-                [
-                    (c"world".as_ptr(), b"hello".as_slice()),
-                    (c"player.dat".as_ptr(), b"xy".as_slice()),
-                ]
-                .as_slice(),
-            ),
-            (
-                c"Slot_2",
-                c"Second",
-                [(c"hdr".as_ptr(), b"z".as_slice())].as_slice(),
-            ),
-            (
-                c"Profile/Main",
-                c"Profile",
-                [(c"p".as_ptr(), b"q".as_slice())].as_slice(),
-            ),
-        ] {
-            let mut container = std::ptr::null_mut();
-            assert_eq!(create(this, provider, cname.as_ptr(), &mut container), S_OK);
-            let mut update = std::ptr::null_mut();
-            assert_eq!(
-                begin_update(this, container, disp.as_ptr(), &mut update),
-                S_OK
-            );
-            for &(bname, data) in blobs {
-                assert_eq!(write(this, update, bname, data.as_ptr(), data.len()), S_OK);
-            }
-            assert_eq!(submit_now(this, update), S_OK);
-            close_update(this, update);
-            close_container(this, container);
+    fn a_noncanonical_folder_does_not_remove_a_committed_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        let slot = container_dir(root, "Slot");
+        for stray in ["v01", "v001", "v+1", "v0", "v02"] {
+            std::fs::create_dir(slot.join(stray)).unwrap();
         }
-
-        extern "system" fn seen_container(
-            info: *const ContainerInfo,
-            context: *mut c_void,
-        ) -> bool {
-            // SAFETY: valid during the callback; the context is the test's vector.
-            let (info, out) = unsafe { (&*info, &mut *context.cast::<Vec<String>>()) };
-            out.push(text(info.name).unwrap());
-            true
+        assert_eq!(state(root), old_state());
+        assert!(slot.join("v1").is_dir());
+        for stray in ["v01", "v001", "v+1", "v0", "v02"] {
+            assert!(slot.join(stray).exists(), "{stray} was removed");
         }
-        let by_name = method::<ByName>(&OBJECT, 0x78);
-        let mut names: Vec<String> = Vec::new();
-        assert_eq!(
-            by_name(
-                this,
-                std::ptr::null(),
-                c"Slot_".as_ptr(),
-                (&raw mut names).cast(),
-                Some(seen_container)
-            ),
-            E_INVALIDARG
-        );
-        assert_eq!(
-            by_name(this, provider, c"Slot_".as_ptr(), (&raw mut names).cast(), None),
-            E_INVALIDARG
-        );
-        for (prefix, expected) in [
-            (c"Slot_".as_ptr(), ["Slot_1", "Slot_2"].as_slice()),
-            (c"Nope".as_ptr(), [].as_slice()),
-            (c"".as_ptr(), ["Profile/Main", "Slot_1", "Slot_2"].as_slice()),
-            (std::ptr::null(), ["Profile/Main", "Slot_1", "Slot_2"].as_slice()),
-        ] {
-            names.clear();
-            assert_eq!(
-                by_name(this, provider, prefix, (&raw mut names).cast(), Some(seen_container)),
-                S_OK
-            );
-            assert_eq!(names, expected);
+    }
+
+    /// A newer version folder that does not read (an empty folder, a file,
+    /// a broken manifest) neither hides the committed save, nor removes it,
+    /// nor blocks the next update, which goes above it.
+    #[test]
+    fn an_unreadable_newer_version_does_not_cost_the_save() {
+        type Make = fn(&Path);
+        let strays: [(&str, Make); 3] = [
+            ("empty folder", |p| std::fs::create_dir(p).unwrap()),
+            ("file", |p| std::fs::write(p, b"not a version").unwrap()),
+            ("broken manifest", |p| {
+                std::fs::create_dir(p).unwrap();
+                std::fs::write(p.join(MANIFEST), [9, 0, 0, 0, b'x']).unwrap();
+            }),
+        ];
+        for (what, make) in strays {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+            let slot = container_dir(root, "Slot");
+            make(&slot.join("v2"));
+
+            assert_eq!(state(root), old_state(), "{what}: read");
+            assert!(slot.join("v1").is_dir(), "{what}: v1 was removed");
+
+            assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK, "{what}: update");
+            let blobs = vec![("a".into(), "new a".into()), ("b".into(), "old b".into())];
+            let after = Some(("two".into(), blobs));
+            assert_eq!(state(root), after, "{what}: after the update");
+            assert!(slot.join("v3").is_dir(), "{what}: the update did not go above v2");
+            // Read again: the new version stays the container.
+            assert_eq!(state(root), after, "{what}: second read");
         }
+    }
 
-        extern "system" fn seen_blob(info: *const BlobInfo, context: *mut c_void) -> bool {
-            // SAFETY: valid during the callback; the context is the test's vector.
-            let (info, out) = unsafe { (&*info, &mut *context.cast::<Vec<(String, u32)>>()) };
-            out.push((text(info.name).unwrap(), info.size));
-            true
-        }
-        let all_blobs = method::<AllBlobs>(&OBJECT, 0x90);
-        let mut container = std::ptr::null_mut();
-        assert_eq!(create(this, provider, c"Slot_1".as_ptr(), &mut container), S_OK);
-        let mut blobs: Vec<(String, u32)> = Vec::new();
-        assert_eq!(
-            all_blobs(
-                this,
-                std::ptr::null(),
-                (&raw mut blobs).cast(),
-                Some(seen_blob)
-            ),
-            E_INVALIDARG
-        );
-        assert_eq!(
-            all_blobs(this, container, (&raw mut blobs).cast(), None),
-            E_INVALIDARG
-        );
-        assert_eq!(
-            all_blobs(this, container, (&raw mut blobs).cast(), Some(seen_blob)),
-            S_OK
-        );
-        assert_eq!(blobs, [("player.dat".into(), 2), ("world".into(), 5)]);
-        close_container(this, container);
-
-        let quota_now = method::<Quota>(&OBJECT, 0x38);
-        let mut left_before = 0i64;
-        assert_eq!(quota_now(this, std::ptr::null(), &mut left_before), E_INVALIDARG);
-        assert_eq!(quota_now(this, provider, std::ptr::null_mut()), E_INVALIDARG);
-        assert_eq!(quota_now(this, provider, &mut left_before), S_OK);
-        assert!(left_before as u64 <= QUOTA - 9);
-
-        let del_now = method::<DeleteContainer>(&OBJECT, 0x50);
-        assert_eq!(
-            del_now(this, std::ptr::null(), c"Slot_1".as_ptr()),
-            E_INVALIDARG
-        );
-        assert_eq!(del_now(this, provider, std::ptr::null()), E_INVALIDARG);
-        assert_eq!(
-            del_now(this, provider, c"bad name".as_ptr()),
-            INVALID_CONTAINER_NAME
-        );
-        assert_eq!(del_now(this, provider, c"Slot_1".as_ptr()), S_OK);
-
-        names.clear();
-        assert_eq!(
-            by_name(
-                this,
-                provider,
-                c"Slot_".as_ptr(),
-                (&raw mut names).cast(),
-                Some(seen_container)
-            ),
-            S_OK
-        );
-        assert_eq!(names, ["Slot_2"]);
-
-        let mut left_after = 0i64;
-        assert_eq!(quota_now(this, provider, &mut left_after), S_OK);
-        assert!(left_after >= left_before);
-        close_provider(this, provider);
+    /// With no readable version at all, reads and updates fail and nothing
+    /// is removed.
+    #[test]
+    fn no_readable_version_is_refused_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a"))]), S_OK);
+        let slot = container_dir(root, "Slot");
+        std::fs::write(slot.join("v1").join(MANIFEST), [1, 2, 3]).unwrap();
+        let c = Provider { root: root.into() }.container("Slot");
+        assert_eq!(read(&c, None).err(), Some(NO_ACCESS));
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), NO_ACCESS);
+        assert!(slot.join("v1").join("0").is_file());
+        assert!(!slot.join("v2").exists());
     }
 }

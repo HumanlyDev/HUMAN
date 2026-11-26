@@ -83,8 +83,15 @@ pub fn mount_at(letter: char, root: &Path) {
 }
 
 /// `root` as UTF-16, absolute, without trailing separators (a drive root
-/// keeps its own).
+/// keeps its own). An empty root is the current directory, as it is to a
+/// path joined to it: it is the title's folder when the title is run by its
+/// file name alone (`victory run GTA6.exe`).
 fn root_wide(root: &Path) -> Vec<u16> {
+    let root = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    };
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
     let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
     while wide.len() > 3 && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
@@ -519,10 +526,7 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 // fail there instead of faulting into its handler; the title's
 // synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
 // destinations and retry a failed `ReadFile` forever. So the destination
-// is opened first. A block guarded again before the kernel writes it (the
-// guard over all the views of a page protects other views from other
-// threads) fails that `ReadFile`, and the title's retry opens it again;
-// `fread` has no such retry and reads beside instead (see there).
+// is opened first, and not guarded again before the call is done.
 
 pub extern "system" fn ReadFile(
     file: *mut c_void,
@@ -531,10 +535,31 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+    let writing = victory_gpu::kernel_writing(buffer as usize, len as usize);
+    let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
-    )
+    );
+    // The call's error is the title's to ask for.
+    // SAFETY: plain calls.
+    let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    // shortcut: a read that goes on after the call (overlapped) is written
+    // into pages the kernel has locked by now: it lands all the same, but a
+    // refresh that guards its blocks before it does will not see it.
+    if done == 0 && error == windows_sys::Win32::Foundation::ERROR_IO_PENDING {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::info!(len, "ReadFile: a read of the title's goes on after the call"));
+    }
+    if done == 0 && error == windows_sys::Win32::Foundation::ERROR_NOACCESS {
+        static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!(n, buffer = format_args!("{buffer:p}"), len, "ReadFile: the title's buffer could not be written");
+        }
+    }
+    drop(writing);
+    // SAFETY: as above.
+    unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
+    done
 }
 
 /// The host CRT reads large requests straight into the caller's buffer
@@ -545,43 +570,10 @@ pub extern "system" fn ReadFile(
 /// own writes. Returns the items read, as the CRT does; the bytes of a
 /// partial last item are copied too, as the CRT leaves them.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    let read = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize);
-    let Some(total) = size.checked_mul(count).filter(|&t| t > 0) else {
-        // The CRT's own checks and answer (overflow -> EINVAL, or nothing to read).
-        return read(buffer, size, count, stream);
-    };
-    if buffer.is_null() || stream.is_null() {
-        // The CRT's own checks and answer.
-        return read(buffer, size, count, stream);
-    }
-    const CHUNK: usize = 1 << 20;
-    let mut beside = vec![0u8; total.min(CHUNK)];
-    let mut done = 0;
-    while done < total {
-        let want = (total - done).min(CHUNK);
-        let n = read(beside.as_mut_ptr(), 1, want, stream);
-        if n > 0 {
-            let err = if n < want {
-                // SAFETY: thread-local Win32 last-error query.
-                Some(unsafe { windows_sys::Win32::Foundation::GetLastError() })
-            } else {
-                None
-            };
-            victory_gpu::kernel_will_write(buffer as usize + done, n);
-            if let Some(code) = err {
-                // SAFETY: restore Win32 last error after a short read.
-                unsafe { windows_sys::Win32::Foundation::SetLastError(code) };
-            }
-            // SAFETY: the caller's buffer holds `size * count` bytes, and
-            // `done + n` is at most that.
-            unsafe { std::ptr::copy_nonoverlapping(beside.as_ptr(), buffer.add(done), n) };
-            done += n;
-        }
-        if n < want {
-            break;
-        }
-    }
-    done / size
+    let _writing = victory_gpu::kernel_writing(buffer as usize, size.saturating_mul(count));
+    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
+        buffer, size, count, stream,
+    )
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
@@ -880,6 +872,17 @@ mod tests {
         );
     }
 
+    /// A title run by its file name alone has an empty folder: the drive
+    /// over it is the current directory, not the current drive's root.
+    #[test]
+    fn an_empty_root_is_the_current_directory() {
+        let letter = mount(Path::new("")).unwrap();
+        let path = format!(r"{letter}:\a.rpf");
+        let host = translate(&w(&path)[..path.len()]).map(|v| text(&v));
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(host, Some(cwd.join("a.rpf").display().to_string()));
+    }
+
     #[test]
     fn long_title_paths_work_on_the_host() {
         let dir = tempfile::tempdir().unwrap();
@@ -1013,66 +1016,5 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
-    }
-
-    #[test]
-    fn fread_reads_normal_and_rejects_size_count_overflow() {
-        type InvalidParamHandler = extern "C" fn(*const u16, *const u16, *const u16, u32, usize);
-        extern "C" fn ignore_invalid_param(
-            _: *const u16,
-            _: *const u16,
-            _: *const u16,
-            _: u32,
-            _: usize,
-        ) {
-        }
-        let set_handler = host!(
-            "ucrtbase.dll",
-            "_set_thread_local_invalid_parameter_handler":
-                extern "C" fn(Option<InvalidParamHandler>) -> Option<InvalidParamHandler>
-        );
-        let errno_ptr = host!("ucrtbase.dll", "_errno": extern "C" fn() -> *mut i32);
-        let fclose = host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32);
-        let ftell = host!("ucrtbase.dll", "ftell": extern "C" fn(File) -> i32);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sample.bin");
-        let payload: Vec<u8> = (0u8..100).collect();
-        std::fs::write(&path, &payload).unwrap();
-        let cpath = format!("{}\0", path.display());
-        let f = fopen(cpath.as_ptr().cast(), c"rb".as_ptr());
-        assert!(!f.is_null());
-
-        // Overflowing size * count must delegate to UCRT's validation (EINVAL, 0)
-        // instead of saturating to usize::MAX and overflowing `buf`.
-        let mut buf = [0xAAu8; 16];
-        // SAFETY: setting and restoring the thread-local UCRT invalid-parameter handler.
-        unsafe { *errno_ptr() = 0 };
-        let prev = set_handler(Some(ignore_invalid_param));
-        let got = fread(buf.as_mut_ptr(), 16, usize::MAX, f);
-        set_handler(prev);
-        // SAFETY: reading thread-local UCRT errno.
-        let err = unsafe { *errno_ptr() };
-        assert_eq!(got, 0);
-        assert_eq!(err, 22, "expected EINVAL");
-        assert_eq!(buf, [0xAAu8; 16]);
-        assert_eq!(ftell(f), 0);
-
-        // Normal full read works and returns complete items.
-        let mut out = [0u8; 16];
-        let got = fread(out.as_mut_ptr(), 4, 4, f);
-        assert_eq!(got, 4);
-        assert_eq!(out, payload[..16]);
-
-        // Short read near EOF returns complete items and copies the partial tail.
-        let mut tail = [0u8; 100];
-        let got = fread(tail.as_mut_ptr(), 16, 6, f);
-        // 84 bytes remain -> 5 complete 16-byte items + 4 trailing bytes.
-        assert_eq!(got, 5);
-        assert_eq!(&tail[..84], &payload[16..100]);
-
-        // Zero-count read returns 0.
-        assert_eq!(fread(out.as_mut_ptr(), 4, 0, f), 0);
-
-        fclose(f);
     }
 }

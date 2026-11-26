@@ -27,19 +27,28 @@ pub fn dump_stacks_on_schedule() {
     let Ok(list) = std::env::var("VICTORY_STACKS") else {
         return;
     };
-    let mut times: Vec<f64> = list
-        .split(',')
-        .filter_map(|t| t.trim().parse().ok())
-        .collect();
-    times.sort_by(f64::total_cmp);
+    let times = schedule(&list);
     let start = std::time::Instant::now();
     std::thread::spawn(move || {
-        for t in times {
-            let at = std::time::Duration::from_secs_f64(t.max(0.0));
+        for at in times {
             std::thread::sleep(at.saturating_sub(start.elapsed()));
             dump_stacks();
         }
     });
+}
+
+/// The times in a `VICTORY_STACKS` list (seconds, comma-separated), in
+/// order. Negative times are now; times no `Duration` holds (`inf`, `NaN`,
+/// `1e20`) are left out instead of panicking the dump thread.
+fn schedule(list: &str) -> Vec<std::time::Duration> {
+    let mut times: Vec<_> = list
+        .split(',')
+        .filter_map(|t| t.trim().parse::<f64>().ok())
+        .filter(|t| !t.is_nan())
+        .filter_map(|t| std::time::Duration::try_from_secs_f64(t.max(0.0)).ok())
+        .collect();
+    times.sort();
+    times
 }
 
 /// `THREAD_BASIC_INFORMATION` (ntddk).
@@ -57,10 +66,8 @@ struct BasicInfo {
 #[repr(C, align(16))]
 struct Aligned(CONTEXT);
 
-/// Prints every other thread's stack to stderr. Each thread is suspended
-/// only while its context is read and unwound into a buffer allocated
-/// beforehand (it may hold the heap lock).
-pub fn dump_stacks() {
+/// The ids of this process's threads but the caller's.
+pub(crate) fn other_threads() -> Vec<u32> {
     // SAFETY: plain queries and a snapshot of this process's threads.
     let (me, process, snapshot) = unsafe {
         (
@@ -70,7 +77,7 @@ pub fn dump_stacks() {
         )
     };
     if snapshot == INVALID_HANDLE_VALUE {
-        return;
+        return Vec::new();
     }
     let mut ids = Vec::new();
     // SAFETY: zeroed is a valid THREADENTRY32; its size is set before use.
@@ -87,6 +94,14 @@ pub fn dump_stacks() {
     }
     // SAFETY: we opened it.
     unsafe { CloseHandle(snapshot) };
+    ids
+}
+
+/// Prints every other thread's stack to stderr. Each thread is suspended
+/// only while its context is read and unwound into a buffer allocated
+/// beforehand (it may hold the heap lock).
+pub fn dump_stacks() {
+    let ids = other_threads();
     eprintln!("VIctory: stacks of {} threads", ids.len());
     for id in ids {
         // SAFETY: opens a thread of our own process.
@@ -100,9 +115,9 @@ pub fn dump_stacks() {
         if thread.is_null() {
             continue;
         }
-        let (frames, (priority, base)) = frames_of(thread);
+        let (frames, (priority, base, affinity)) = frames_of(thread);
         eprintln!(
-            "  thread {id} \"{}\" start {} priority {priority} (base {base})",
+            "  thread {id} \"{}\" start {} priority {priority} (base {base}) affinity {affinity:#x}",
             name_of(thread),
             locate(start_of(thread))
         );
@@ -115,8 +130,7 @@ pub fn dump_stacks() {
 }
 
 /// The thread's frames and its current and base scheduling priority (0-31).
-fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
-    const STATUS_PENDING: i32 = 0x0000_0103;
+pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
     let mut frames = Vec::with_capacity(MAX_FRAMES);
     let mut info: BasicInfo = BasicInfo {
         exit_status: 0,
@@ -126,37 +140,46 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
         priority: 0,
         base_priority: 0,
     };
-    // SAFETY: zeroed is a valid CONTEXT.
-    let mut context = Aligned(unsafe { std::mem::zeroed() });
-    context.0.ContextFlags = CONTEXT_FULL_AMD64;
-    // SAFETY: suspend the thread BEFORE querying and reading its TEB so the
-    // thread cannot exit (unmapping its TEB) or grow its stack (invalidating
-    // StackLimit) between reading `info.teb` and capturing its context.
-    unsafe {
-        if SuspendThread(thread) == u32::MAX {
-            return (frames, (0, 0));
-        }
-        let status = NtQueryInformationThread(
+    // Suspended first: a running thread may exit and free its TEB between
+    // the query and the read below.
+    // SAFETY: a thread of this process that is not this one.
+    if unsafe { SuspendThread(thread) } == u32::MAX {
+        return (frames, (0, 0, 0));
+    }
+    // SAFETY: writes `info`, whose layout and size are the system's.
+    let status = unsafe {
+        NtQueryInformationThread(
             thread,
             ThreadBasicInformation,
             (&raw mut info).cast(),
             size_of::<BasicInfo>() as u32,
             std::ptr::null_mut(),
-        );
-        if status == 0 && info.exit_status == STATUS_PENDING && !info.teb.is_null() {
-            // SAFETY: the thread is suspended and still running (`STATUS_PENDING`),
-            // so its TEB is mapped; NT_TIB holds StackBase at +8 and StackLimit at +0x10.
-            let (high, low) = (info.teb.add(1).read(), info.teb.add(2).read());
-            if low <= high && GetThreadContext(thread, &mut context.0) != 0 {
-                unwind_into(context.0, low, high, &mut frames);
-            }
+        )
+    };
+    if status != 0 || info.teb.is_null() {
+        // SAFETY: suspended above.
+        unsafe { ResumeThread(thread) };
+        return (frames, (0, 0, 0));
+    }
+    // SAFETY: the TEB of a suspended thread of this process: its NT_TIB
+    // holds the stack base at +8 and the stack limit at +0x10.
+    let (high, low) = unsafe { (info.teb.add(1).read(), info.teb.add(2).read()) };
+    // SAFETY: zeroed is a valid CONTEXT.
+    let mut context = Aligned(unsafe { std::mem::zeroed() });
+    context.0.ContextFlags = CONTEXT_FULL_AMD64;
+    // SAFETY: reads and resumes the thread suspended above; nothing until
+    // the resume allocates or takes a lock the thread could hold besides
+    // the unwinder's own.
+    unsafe {
+        if GetThreadContext(thread, &mut context.0) != 0 {
+            unwind_into(context.0, low, high, &mut frames);
         }
         ResumeThread(thread);
     }
-    (frames, (info.priority, info.base_priority))
+    (frames, (info.priority, info.base_priority, info.affinity))
 }
 
-fn start_of(thread: HANDLE) -> usize {
+pub(crate) fn start_of(thread: HANDLE) -> usize {
     let mut start = 0usize;
     // SAFETY: writes one pointer-sized start address.
     unsafe {
@@ -171,7 +194,7 @@ fn start_of(thread: HANDLE) -> usize {
     start
 }
 
-fn name_of(thread: HANDLE) -> String {
+pub(crate) fn name_of(thread: HANDLE) -> String {
     let mut name = std::ptr::null_mut();
     // SAFETY: the system allocates the string; we free it with LocalFree.
     unsafe {
@@ -219,31 +242,17 @@ mod tests {
         parked.join().unwrap();
     }
 
+    /// Times no `Duration` holds are left out instead of panicking the dump
+    /// thread (`from_secs_f64` panicked on `inf`); the rest come in order.
     #[test]
-    fn frames_of_handles_exited_thread_safely() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-        let short = std::thread::spawn(move || {
-            // SAFETY: plain query.
-            tx.send(unsafe { GetCurrentThreadId() }).unwrap();
-            go_rx.recv().ok();
-        });
-        let id = rx.recv().unwrap();
-        // SAFETY: opens a thread of this process; keep the handle past exit.
-        let thread = unsafe {
-            OpenThread(
-                THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
-                0,
-                id,
-            )
+    fn schedules_skip_times_out_of_range() {
+        let secs = |list| {
+            schedule(list)
+                .iter()
+                .map(|d| d.as_secs_f64())
+                .collect::<Vec<_>>()
         };
-        assert!(!thread.is_null());
-        go_tx.send(()).unwrap();
-        short.join().unwrap();
-        // The thread has exited and its TEB is unmapped; `frames_of` must not fault.
-        let (frames, _) = frames_of(thread);
-        assert!(frames.is_empty());
-        // SAFETY: opened above.
-        unsafe { CloseHandle(thread) };
+        assert_eq!(secs("30, 5,x,-2,inf,NaN,1e20"), [0.0, 5.0, 30.0]);
+        assert!(schedule("").is_empty());
     }
 }

@@ -5,7 +5,7 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 pub mod census;
 pub mod opt;
@@ -113,9 +113,6 @@ pub(crate) enum Cast {
 
 /// Compare predicates: floats 0-15, integers 32-41.
 pub(crate) mod pred {
-    // FALSE and TRUE are not emitted: WARP removes its device on them (and
-    // DXC folds them away), so constant compares lower as constants.
-    #[allow(dead_code)]
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
     pub const OGT: u8 = 2;
@@ -134,7 +131,6 @@ pub(crate) mod pred {
     pub const ULT: u8 = 12;
     pub const ULE: u8 = 13;
     pub const UNE: u8 = 14;
-    #[allow(dead_code)]
     pub const TRUE: u8 = 15;
     pub const EQ: u8 = 32;
     pub const NE: u8 = 33;
@@ -390,76 +386,6 @@ impl Module {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn memory_ir_stats(
-        &self,
-        faults: Option<V>,
-        directory: Option<V>,
-    ) -> MemoryIrStats {
-        let mut stats = MemoryIrStats::default();
-        let n = self.blocks.len();
-        let mut pred_count = vec![0usize; n];
-        let mut pred_cond = vec![false; n];
-        for b in &self.blocks {
-            match b.term {
-                Some(Term::Br(t)) => pred_count[t] += 1,
-                Some(Term::CondBr(_, t, f)) => {
-                    pred_count[t] += 1;
-                    pred_cond[t] = true;
-                    pred_count[f] += 1;
-                    pred_cond[f] = true;
-                }
-                _ => {}
-            }
-        }
-        let is_i32_const = |v: V, want: u32| -> bool {
-            matches!(
-                v,
-                V::Const(i) if matches!(self.consts[i as usize].1, Const::Int(x) if (x as u32) == want)
-            )
-        };
-        for (bi, b) in self.blocks.iter().enumerate() {
-            let guarded = bi != 0 && pred_count[bi] == 1 && pred_cond[bi];
-            for &id in &b.body {
-                match &self.insts[id as usize].op {
-                    Op::Bin(Bin::URem, _, rhs)
-                        if is_i32_const(*rhs, super::shader::MEMORY_FAULTS - 1) =>
-                    {
-                        stats.fault_urems_total += 1;
-                        if guarded {
-                            stats.fault_urems_guarded += 1;
-                        }
-                    }
-                    Op::Cmp(pred::IUGE, _, rhs) if is_i32_const(*rhs, 0xFFC0) => {
-                        stats.straddle_cmps += 1;
-                    }
-                    Op::Call(f, args) => {
-                        let name = self.funcs[*f as usize].name.as_str();
-                        if name == "dx.op.rawBufferStore.i32"
-                            && faults.is_some()
-                            && args.get(1) == faults.as_ref()
-                        {
-                            stats.fault_stores_total += 1;
-                            if guarded {
-                                stats.fault_stores_guarded += 1;
-                            }
-                        } else if name == "dx.op.rawBufferLoad.f32"
-                            && directory.is_some()
-                            && args.get(1) == directory.as_ref()
-                        {
-                            stats.dir_loads_total += 1;
-                            if guarded {
-                                stats.dir_loads_guarded += 1;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        stats
-    }
-
     pub fn new_block(&mut self) -> usize {
         self.blocks.push(Block::default());
         self.blocks.len() - 1
@@ -596,34 +522,6 @@ impl Module {
     /// conditions, and whatever they read, transitively (a phi nothing reads
     /// is dropped). A worklist visits each instruction once, so a long chain
     /// of merges costs one pass, not one pass per merge.
-    /// Computes which empty latch blocks (only a `Br(h)` backedge from a
-    /// single predecessor `p`) can be folded into `p` without creating
-    /// duplicate `(p, h)` edges into header `h`'s PHI nodes.
-    fn empty_latch_folds(&self, post: &[usize], pos: &[u64]) -> Vec<Option<(usize, usize)>> {
-        let succs = |b: usize| successors(self.blocks[b].term);
-        let mut preds = vec![Vec::new(); self.blocks.len()];
-        for &b in post {
-            for &s in succs(b).iter() {
-                preds[s].push(b);
-            }
-        }
-        let mut fold = vec![None; self.blocks.len()];
-        for &b in post {
-            let blk = &self.blocks[b];
-            if let (Some(Term::Br(h)), true, [p]) = (
-                blk.term,
-                blk.phis.is_empty() && blk.body.is_empty(),
-                &preds[b][..],
-            ) && pos[h] < pos[b]
-                && !succs(*p).contains(&h)
-                && !fold.contains(&Some((*p, h)))
-            {
-                fold[b] = Some((*p, h));
-            }
-        }
-        fold
-    }
-
     fn live(&self) -> Vec<bool> {
         let mut live = vec![false; self.insts.len()];
         let mut work: Vec<u32> = Vec::new();
@@ -649,75 +547,6 @@ impl Module {
             });
         }
         live
-    }
-
-    /// Gives every loop header one back edge, as DXC's code has:
-    /// vkd3d-proton's DXIL conversion keeps one per header, takes any other
-    /// for a forward edge and then recurses without end over the cycle that
-    /// makes (in programs with wave shuffles). The back edges of a header
-    /// with several go through a new block that joins their phi values.
-    pub fn single_latches(&mut self) {
-        let n = self.blocks.len();
-        if n == 0 {
-            return;
-        }
-        // Depth-first from the entry: an edge to a block still on the stack
-        // is a back edge (the control flow is reducible).
-        let mut state = vec![0u8; n];
-        let mut stack = vec![(0usize, 0usize)];
-        state[0] = 1;
-        let mut latches: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        while let Some(top) = stack.last_mut() {
-            let (b, k) = *top;
-            let succ = successors(self.blocks[b].term);
-            if k < succ.len() {
-                top.1 += 1;
-                let t = succ[k];
-                match state[t] {
-                    0 => {
-                        state[t] = 1;
-                        stack.push((t, 0));
-                    }
-                    1 => latches.entry(t).or_default().push(b),
-                    _ => {}
-                }
-            } else {
-                state[b] = 2;
-                stack.pop();
-            }
-        }
-        for (header, mut from) in latches {
-            from.sort_unstable();
-            from.dedup();
-            if from.len() < 2 {
-                continue;
-            }
-            let latch = self.new_block();
-            for &b in &from {
-                let to = |t: usize| if t == header { latch } else { t };
-                self.blocks[b].term = match self.blocks[b].term {
-                    Some(Term::Br(t)) => Some(Term::Br(to(t))),
-                    Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, to(t), to(f))),
-                    other => other,
-                };
-            }
-            self.blocks[latch].term = Some(Term::Br(header));
-            for id in self.blocks[header].phis.clone() {
-                let Op::Phi(incoming) = self.insts[id as usize].op.clone() else {
-                    continue;
-                };
-                let ty = self.insts[id as usize].ty;
-                let (back, mut rest): (Vec<_>, Vec<_>) =
-                    incoming.into_iter().partition(|(_, b)| from.contains(b));
-                if back.is_empty() {
-                    continue;
-                }
-                let joined = self.phi(latch, ty);
-                self.set_phi(joined, back);
-                rest.push((joined, latch));
-                self.insts[id as usize].op = Op::Phi(rest);
-            }
-        }
     }
 
     pub fn write(&self) -> Vec<u8> {
@@ -884,7 +713,28 @@ impl Module {
         for (n, &b) in post.iter().enumerate() {
             pos[b] = n as u64;
         }
-        let fold = self.empty_latch_folds(&post, &pos);
+        // An empty latch (only a branch back to its loop header) is folded
+        // into its one predecessor, so the exiting block is the latch as in
+        // DXC's loops; the AMD driver hangs on divergent loops otherwise.
+        let mut preds = vec![Vec::new(); self.blocks.len()];
+        for &b in &post {
+            for &s in succs(b).iter() {
+                preds[s].push(b);
+            }
+        }
+        let mut fold = vec![None; self.blocks.len()];
+        for &b in &post {
+            let blk = &self.blocks[b];
+            if let (Some(Term::Br(h)), true, [p]) = (
+                blk.term,
+                blk.phis.iter().all(|&i| !live[i as usize]) && blk.body.is_empty(),
+                &preds[b][..],
+            ) && pos[h] < pos[b]
+                && !succs(*p).contains(&h)
+            {
+                fold[b] = Some((*p, h));
+            }
+        }
         let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
         let mut pos = vec![u64::MAX; self.blocks.len()];
         for (n, &b) in layout.iter().enumerate() {
@@ -1076,18 +926,6 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
             idx.iter().copied().for_each(f);
         }
     }
-}
-
-#[cfg(test)]
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MemoryIrStats {
-    pub fault_stores_total: usize,
-    pub fault_stores_guarded: usize,
-    pub fault_urems_total: usize,
-    pub fault_urems_guarded: usize,
-    pub dir_loads_total: usize,
-    pub dir_loads_guarded: usize,
-    pub straddle_cmps: usize,
 }
 
 /// A block's successors (at most two), without allocating.
@@ -1359,52 +1197,50 @@ mod tests {
     }
 
     #[test]
+    fn empty_latch_with_dead_phis_is_folded() {
+        // Two identical loops except one has an unread phi in its empty latch;
+        // both must fold the latch and emit identical bitcode.
+        let build = |with_dead_phi: bool| {
+            let mut m = Module::default();
+            let i32t = m.int(32);
+            let void = m.void();
+            let fty = m.func_ty(void, vec![i32t]);
+            let f = m.function("sink", fty, Some(Attr::NoUnwind), false);
+            let main_ty = m.func_ty(void, vec![]);
+            m.function("main", main_ty, None, true);
+            let (entry, head, body, latch, exit) = (
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+            );
+            let (z, one, ten) = (m.i32(0), m.i32(1), m.i32(10));
+            m.terminate(entry, Term::Br(head));
+            let i = m.phi(head, i32t);
+            m.terminate(head, Term::Br(body));
+            let next = m.bin(body, Bin::Add, i, one);
+            let cond = m.cmp(body, pred::IULT, next, ten);
+            m.terminate(body, Term::CondBr(cond, latch, exit));
+            if with_dead_phi {
+                let dead = m.phi(latch, i32t);
+                m.set_phi(dead, vec![(next, body)]);
+            }
+            m.terminate(latch, Term::Br(head));
+            m.set_phi(i, vec![(z, entry), (next, latch)]);
+            let _ = m.call(exit, f, vec![next]);
+            m.terminate(exit, Term::Ret);
+            m.write()
+        };
+        assert_eq!(build(false), build(true));
+    }
+
+    #[test]
     fn successors_of_each_terminator() {
         assert!(successors(None).is_empty());
         assert!(successors(Some(Term::Ret)).is_empty());
         assert_eq!(&*successors(Some(Term::Br(7))), &[7]);
         assert_eq!(&*successors(Some(Term::CondBr(V::Const(0), 3, 5))), &[3, 5]);
-    }
-
-    /// A loop header with two back edges gets one, through a new block that
-    /// joins what each brings (vkd3d-proton keeps one per header).
-    #[test]
-    fn a_header_with_two_back_edges_gets_one() {
-        let mut m = Module::default();
-        let i32t = m.int(32);
-        let void = m.void();
-        let main_ty = m.func_ty(void, vec![]);
-        m.function("main", main_ty, None, true);
-        let [entry, head, body, mid, exit] = [(); 5].map(|()| m.new_block());
-        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
-        m.terminate(entry, Term::Br(head));
-        let p = m.phi(head, i32t);
-        m.terminate(head, Term::Br(body));
-        let x = m.bin(body, Bin::Add, p, one);
-        let c = m.cmp(body, pred::IULT, x, two);
-        m.terminate(body, Term::CondBr(c, head, mid));
-        let y = m.bin(mid, Bin::Add, x, one);
-        let d = m.cmp(mid, pred::IULT, y, two);
-        m.terminate(mid, Term::CondBr(d, head, exit));
-        m.terminate(exit, Term::Ret);
-        m.set_phi(p, vec![(zero, entry), (x, body), (y, mid)]);
-        m.single_latches();
-        let latch = m.blocks.len() - 1;
-        assert_eq!(&*successors(m.blocks[body].term), &[latch, mid]);
-        assert_eq!(&*successors(m.blocks[mid].term), &[latch, exit]);
-        assert_eq!(&*successors(m.blocks[latch].term), &[head]);
-        let phi = |m: &Module, v: V| match v {
-            V::Inst(id) => match &m.insts[id as usize].op {
-                Op::Phi(incoming) => incoming.clone(),
-                op => panic!("{op:?}"),
-            },
-            v => panic!("{v:?}"),
-        };
-        let incoming = phi(&m, p);
-        assert_eq!(incoming[0], (zero, entry));
-        assert_eq!(incoming[1].1, latch);
-        assert_eq!(phi(&m, incoming[1].0), [(x, body), (y, mid)]);
-        assert!(!m.write().is_empty());
     }
 
     /// The written bytes are pinned to what the writer produced before the
@@ -1418,61 +1254,6 @@ mod tests {
             let bytes = synthetic(regs, stages, read).write();
             assert_eq!((bytes.len(), fnv(&bytes)), (len, hash), "{regs}x{stages}");
         }
-    }
-
-    /// When a conditional branch `p` targets two empty latch blocks `b1` and
-    /// `b2` that both jump back to loop header `h`, at most one may be folded
-    /// into `(p, h)`. Folding both would rewrite both edges as coming from
-    /// `%p`, producing invalid LLVM/DXIL PHI records with duplicate incoming
-    /// predecessor blocks carrying different values.
-    #[test]
-    fn twin_empty_latches_from_one_predecessor_do_not_both_fold() {
-        let mut m = Module::default();
-        let i32t = m.int(32);
-        let (entry, head, body, b1, b2, exit) = (
-            m.new_block(),
-            m.new_block(),
-            m.new_block(),
-            m.new_block(),
-            m.new_block(),
-            m.new_block(),
-        );
-        let v0 = m.i32(0);
-        let v1 = m.i32(1);
-        let v2 = m.i32(2);
-        let phi = m.phi(head, i32t);
-        m.set_phi(phi, vec![(v0, entry), (v1, b1), (v2, b2)]);
-        m.terminate(entry, Term::Br(head));
-        let stay = m.cmp(head, pred::EQ, phi, v0);
-        m.terminate(head, Term::CondBr(stay, body, exit));
-        let branch = m.cmp(body, pred::EQ, phi, v1);
-        m.terminate(body, Term::CondBr(branch, b1, b2));
-        m.terminate(b1, Term::Br(head));
-        m.terminate(b2, Term::Br(head));
-        m.terminate(exit, Term::Ret);
-
-        let post = vec![entry, head, body, b1, b2, exit];
-        let mut pos = vec![u64::MAX; m.blocks.len()];
-        for (n, &b) in post.iter().enumerate() {
-            pos[b] = n as u64;
-        }
-        let fold = m.empty_latch_folds(&post, &pos);
-        // Exactly one of (b1, b2) folds; the other remains its own block so
-        // `head`'s PHI incoming predecessor block IDs stay pairwise distinct.
-        let folded_count = [b1, b2].iter().filter(|&&b| fold[b].is_some()).count();
-        assert_eq!(folded_count, 1, "only one empty latch from `body` to `head` may fold");
-        let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
-        let mut layout_pos = vec![u64::MAX; m.blocks.len()];
-        for (n, &b) in layout.iter().enumerate() {
-            layout_pos[b] = n as u64;
-        }
-        let from = |b: usize| fold[b].map_or(layout_pos[b], |(p, _)| layout_pos[p]);
-        let preds = [from(entry), from(b1), from(b2)];
-        assert_ne!(preds[0], preds[1]);
-        assert_ne!(preds[0], preds[2]);
-        assert_ne!(preds[1], preds[2]);
-        // And writing the module completes cleanly.
-        assert!(!m.write().is_empty());
     }
 
     #[test]

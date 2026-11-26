@@ -45,22 +45,9 @@ pub(crate) fn listed(n: u64) -> bool {
             .filter_map(|f| f.trim().parse().ok())
             .collect()
     });
-    // A file named `now` in the capture folder: the next three frames are
-    // captured (and the file removed), to catch a view on demand.
-    static CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-    static NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-    use std::sync::atomic::Ordering::Relaxed;
-    if CHECKED.swap(n, Relaxed) != n
-        && let Some(f) = folder()
-        && std::fs::remove_file(f.join("now")).is_ok()
-    {
-        NOW.store(n + 1, Relaxed);
-    }
-    let now = NOW.load(Relaxed);
-    let on_demand = now != u64::MAX && n >= now && n < now + 3;
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || on_demand || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -133,22 +120,6 @@ fn world_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD").is_some())
 }
 
-/// Every how many world frames a picture is saved with
-/// `VICTORY_CAPTURE_WORLD` (`VICTORY_CAPTURE_WORLD_EVERY`, 8 unless said).
-///
-/// A saved frame is read back at once and written as a PNG inside the
-/// present: run 225's frame log has every saved frame of the cell at 371 ms
-/// against a usual 136 (the present's own copy and show 137 ms instead of
-/// 2, and 123 ms more waiting for the card). At every 8th frame that was
-/// the regular dip of every test run, and a fifth of its time. A run that
-/// measures speed asks for 64 or more.
-fn world_every() -> u64 {
-    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *EVERY.get_or_init(|| {
-        std::env::var("VICTORY_CAPTURE_WORLD_EVERY").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(8)
-    })
-}
-
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -180,7 +151,7 @@ pub(crate) fn wanted(n: u64) -> bool {
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
@@ -189,31 +160,9 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
     save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
 }
 
-/// Whether `len` bytes hold `h` rows of `w` elements (`bpp` bytes each)
-/// laid out `pitch` bytes apart, with the final row unpadded as D3D12's
-/// `GetCopyableFootprints` `pTotalBytes` reports.
-fn rows_fit(w: usize, h: usize, pitch: usize, bpp: usize, len: usize) -> bool {
-    if w == 0 || h == 0 {
-        return false;
-    }
-    let Some(row_bytes) = w.checked_mul(bpp) else {
-        return false;
-    };
-    if pitch < row_bytes {
-        return false;
-    }
-    (h - 1)
-        .checked_mul(pitch)
-        .and_then(|start| start.checked_add(row_bytes))
-        .is_some_and(|need| need <= len)
-}
-
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
-    if !rows_fit(width as usize, height as usize, pitch, 4, rows.len()) {
-        return;
-    }
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
@@ -229,6 +178,27 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
             }
         }
     }
+    let png = encode(w, h, &raw);
+    let path = folder.join(format!("{name}.png"));
+    match std::fs::write(&path, png) {
+        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
+    }
+}
+
+/// A PNG of `width * height` pixels of 8-bit RGB.
+pub(crate) fn png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
+    let row = width as usize * 3;
+    let mut raw = Vec::with_capacity((row + 1) * height as usize);
+    for line in rgb.chunks_exact(row.max(1)) {
+        raw.push(0);
+        raw.extend_from_slice(line);
+    }
+    encode(width, height, &raw)
+}
+
+/// A PNG of rows of RGB, each behind its filter byte.
+fn encode(w: u32, h: u32, raw: &[u8]) -> Vec<u8> {
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     let mut header = Vec::new();
     header.extend(w.to_be_bytes());
@@ -236,15 +206,11 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
     chunk(&mut png, b"IHDR", &header);
     let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
-    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, &raw, zlib_rs::DeflateConfig::new(3));
+    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, raw, zlib_rs::DeflateConfig::new(3));
     debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
     chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
-    let path = folder.join(format!("{name}.png"));
-    match std::fs::write(&path, png) {
-        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
-        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
-    }
+    png
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -268,13 +234,12 @@ fn crc32(bytes: &[u8]) -> u32 {
 }
 
 /// Records a copy of `texture` (in the copy-source state) into a
-/// readback buffer, returning the buffer, footprint, and exact byte size
-/// (`pTotalBytes` from `GetCopyableFootprints`).
+/// readback buffer.
 pub(crate) fn read_back(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
-) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u64)> {
+) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
     read_back_of(device, list, texture, 0)
 }
 
@@ -285,7 +250,7 @@ fn read_back_of(
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
     sub: u32,
-) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u64)> {
+) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0;
     // SAFETY: a live texture; outputs for one subresource.
@@ -301,9 +266,6 @@ fn read_back_of(
             None,
             Some(&mut total),
         );
-    }
-    if total == 0 {
-        return None;
     }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_READBACK,
@@ -351,7 +313,7 @@ fn read_back_of(
             },
         };
         list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
-        Some((buffer, footprint, total))
+        Some((buffer, footprint))
     }
 }
 
@@ -360,7 +322,6 @@ pub(crate) fn save_read_back(
     frame: u64,
     buffer: &ID3D12Resource,
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
-    total: u64,
 ) {
     let f = footprint.Footprint;
     let bgra = match f.Format {
@@ -371,16 +332,14 @@ pub(crate) fn save_read_back(
             return;
         }
     };
-    let Ok(len) = usize::try_from(total) else {
-        return;
-    };
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished (every submission is waited for); the
-    // readback buffer was created with `Width == total`.
+    // mapping spans the footprint's rows.
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
+        let len = f.RowPitch as usize * f.Height as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
         save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
         buffer.Unmap(0, None);
@@ -399,7 +358,7 @@ static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::Hos
 
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
+    *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
 
 /// Notes a title texture the frame being built renders to or writes.
@@ -470,24 +429,22 @@ fn dump_one(
     let (read, stencil) = read;
     list.close();
     host.execute(&[&list]);
-    if let Some((buffer, footprint, total)) = stencil {
-        stencil_values(&buffer, &footprint, total, frame, resource);
+    if let Some((buffer, footprint)) = stencil {
+        stencil_values(&buffer, &footprint, frame, resource);
     }
-    let Some((buffer, footprint, total)) = read else { return };
-    let Ok(len) = usize::try_from(total) else { return };
+    let Some((buffer, footprint)) = read else { return };
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished; the readback buffer was created with
-    // `Width == total`.
+    // SAFETY: the copy finished; the mapping spans the footprint's rows.
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
         // A 24-bit depth plane comes back as 32-bit words: which depth values
         // (low 24 bits) and which top bytes it holds, the most common first.
-        if matches!(d.Format.0, 44..=47) && rows_fit(f.Width as usize, f.Height as usize, pitch, 4, rows.len()) {
+        if matches!(d.Format.0, 44..=47) {
             let mut depths = std::collections::HashMap::<u32, u32>::new();
             let mut tops = std::collections::HashMap::<u32, u32>::new();
             for y in 0..f.Height as usize {
@@ -524,26 +481,19 @@ fn dump_one(
 fn stencil_values(
     buffer: &ID3D12Resource,
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
-    total: u64,
     frame: u64,
     resource: crate::object::This,
 ) {
     let f = footprint.Footprint;
     let (w, h, pitch) = (f.Width as usize, f.Height as usize, f.RowPitch as usize);
-    let Ok(len) = usize::try_from(total) else {
-        return;
-    };
-    if !rows_fit(w, h, pitch, 1, len) {
-        return;
-    }
     let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished; the readback buffer was created with
-    // `Width == total`, and `rows_fit` verified every accessed byte lies in it.
+    // SAFETY: the copy finished; the mapping spans the footprint's rows of
+    // one byte a texel, the last row without its padding.
     unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
+        if h == 0 || w == 0 || buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * (h - 1) + w);
         let mut values = [0u32; 256];
         let mut bits = [0u32; 8];
         // Left, top, right, bottom of the texels with bit 3.
@@ -590,7 +540,6 @@ fn half(h: u16) -> f32 {
     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
     let v = match exp {
         0 => man * 2f32.powi(-24),
-        31 if man != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + man / 1024.0) * 2f32.powi(e - 15),
     };
@@ -603,17 +552,17 @@ fn small_float(bits: u32, man: u32) -> f32 {
     let (exp, m) = ((bits >> man) & 0x1f, (bits & ((1 << man) - 1)) as f32);
     match exp {
         0 => m / (1 << man) as f32 * 2f32.powi(-14),
-        31 if m != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + m / (1 << man) as f32) * 2f32.powi(e as i32 - 15),
     }
 }
 
-/// Converts host-format rows to opaque 8-bit RGBA for the RGB dump. Byte
-/// colors and packed 16-bit BGR use their full channel range. Other formats
-/// scale to the highest finite value, with single channels shown in grey
-/// from their lowest to highest value. Returns `None` for unhandled formats.
+/// Rows of a host format as 8-bit RGBA: 8-bit color as is, everything else
+/// as channel values scaled so the largest finite one is white (single
+/// channels: lowest black, highest white, as grey). `None` for formats not
+/// handled.
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
@@ -621,10 +570,6 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
         27..=32 => {
-            if !rows_fit(w, h, pitch, 4, rows.len()) {
-                return None;
-            }
-            let mut out = Vec::with_capacity(w * h * 4);
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
@@ -635,38 +580,10 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         }
         // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).
         87 | 88 | 90..=93 => {
-            if !rows_fit(w, h, pitch, 4, rows.len()) {
-                return None;
-            }
-            let mut out = Vec::with_capacity(w * h * 4);
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
                     out.extend([p[2], p[1], p[0], 255]);
-                }
-            }
-            return Some(out);
-        }
-        // B5G6R5, B5G5R5A1 and B4G4R4A4 store blue in the low bits.
-        85 | 86 | 115 => {
-            let (rb_bits, green_bits) = match format {
-                85 => (5, 6),
-                86 => (5, 5),
-                _ => (4, 4),
-            };
-            let unorm8 = |value: u16, bits: u32| {
-                let max = (1u16 << bits) - 1;
-                (((value & max) * 255 + max / 2) / max) as u8
-            };
-            for y in 0..h {
-                for x in 0..w {
-                    let word = u16_at(px(x, y, 2), 0);
-                    out.extend([
-                        unorm8(word >> (rb_bits + green_bits), rb_bits),
-                        unorm8(word >> rb_bits, green_bits),
-                        unorm8(word, rb_bits),
-                        255,
-                    ]);
                 }
             }
             return Some(out);
@@ -697,10 +614,6 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         60..=65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
         _ => return None,
     };
-    if !rows_fit(w, h, pitch, n, rows.len()) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(w * h * 4);
     let values: Vec<[f32; 3]> = (0..h)
         .flat_map(|y| (0..w).map(move |x| (x, y)))
         .map(|(x, y)| decode(px(x, y, n)))
@@ -931,80 +844,8 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn half_classifies_special_and_finite_values() {
-        use super::half;
-
-        assert!(half(0x7c01).is_nan());
-        assert!(half(0xfe00).is_nan());
-        assert_eq!(half(0x7c00), f32::INFINITY);
-        assert_eq!(half(0xfc00), f32::NEG_INFINITY);
-        assert_eq!(half(0x0000).to_bits(), 0.0f32.to_bits());
-        assert_eq!(half(0x8000).to_bits(), (-0.0f32).to_bits());
-        assert_eq!(half(0x0001), 2f32.powi(-24));
-        assert_eq!(half(0xbe00), -1.5);
-    }
-
-    #[test]
-    fn packed_float_classifies_special_and_finite_values() {
-        use super::small_float;
-
-        for mantissa_bits in [5, 6] {
-            let special = 31 << mantissa_bits;
-            assert!(small_float(special | 1, mantissa_bits).is_nan());
-            assert!(small_float(special | (1 << (mantissa_bits - 1)), mantissa_bits).is_nan());
-            assert_eq!(small_float(special, mantissa_bits), f32::INFINITY);
-            assert_eq!(small_float(0, mantissa_bits).to_bits(), 0.0f32.to_bits());
-            assert_eq!(small_float(1, mantissa_bits), 2f32.powi(-14 - mantissa_bits as i32));
-            assert_eq!(small_float(15 << mantissa_bits, mantissa_bits), 1.0);
-        }
-    }
-
-    #[test]
-    fn hdr_targets_render_nan_and_infinity_as_distinct_channel_values() {
-        // R16G16B16A16_FLOAT: [NaN, +Inf, NaN], [1, 0.5, 0].
-        let half = [0x7c01u16, 0x7c00, 0xfe00, 0, 0x3c00, 0x3800, 0, 0];
-        let half: Vec<_> = half.into_iter().flat_map(u16::to_le_bytes).collect();
-        // R11G11B10_FLOAT: the same values with 6-bit and 5-bit mantissas.
-        let packed = [
-            0x7c1u32 | (0x7c0 << 11) | (0x3e1 << 22),
-            0x3c0 | (0x380 << 11),
-        ];
-        let packed: Vec<_> = packed.into_iter().flat_map(u32::to_le_bytes).collect();
-        // The HDR display curve maps the finite 0.5 channel to 202.
-        let expected = [0, 255, 0, 255, 255, 202, 0, 255];
-        let half_rgba = super::to_rgba(10, 2, 1, half.len(), &half);
-        let packed_rgba = super::to_rgba(26, 2, 1, packed.len(), &packed);
-        assert_eq!(
-            (half_rgba.as_deref(), packed_rgba.as_deref()),
-            (Some(&expected[..]), Some(&expected[..])),
-        );
-    }
-
-    #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
-    }
-
-    #[test]
-    fn packed_bgr_targets_preserve_color_and_skip_row_padding() {
-        // Each 2x2 target has red, green, blue and a mixed color. The first
-        // row has a padding word, and alpha bits do not affect the RGB dump.
-        for (format, words, mixed) in [
-            (85, [0xf800u16, 0x07e0, 0x001f, 0x8408], [132, 130, 66, 255]),
-            (86, [0x7c00, 0x03e0, 0x801f, 0xc208], [132, 132, 66, 255]),
-            (115, [0x0f00, 0x00f0, 0xf00f, 0xf841], [136, 68, 17, 255]),
-        ] {
-            let [red, green, blue, blend] = words;
-            let rows = [red, green, 0xcafe, blue, blend]
-                .map(u16::to_le_bytes)
-                .concat();
-            let expected = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], mixed].concat();
-            assert_eq!(
-                super::to_rgba(format, 2, 2, 6, &rows),
-                Some(expected),
-                "format {format}"
-            );
-        }
     }
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
@@ -1019,36 +860,5 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
-    }
-
-    /// `GetCopyableFootprints` omits trailing row-pitch padding after the
-    /// last row (`total = (h - 1) * pitch + w * bpp`, strictly smaller than
-    /// `h * pitch` whenever `w * bpp < pitch`). `to_rgba` and `rows_fit`
-    /// must accept exact `total`-sized buffers and reject short ones without
-    /// panicking or slicing past the readback buffer.
-    #[test]
-    fn unpadded_last_row_fits_and_short_buffer_is_rejected() {
-        // 5x2 RGBA8 with 256-byte row pitch: total = 256 + 20 = 276 (< 512).
-        let (w, h, pitch) = (5usize, 2usize, 256usize);
-        let total = (h - 1) * pitch + w * 4;
-        assert!(total < h * pitch);
-        assert!(super::rows_fit(w, h, pitch, 4, total));
-        assert!(!super::rows_fit(w, h, pitch, 4, total - 1));
-        assert!(!super::rows_fit(0, h, pitch, 4, total));
-        assert!(!super::rows_fit(w, h, 4, 4, total)); // pitch < row_bytes
-
-        let mut buf = vec![0u8; total];
-        buf[0..4].copy_from_slice(&[10, 20, 30, 40]);
-        buf[pitch + 16..pitch + 20].copy_from_slice(&[50, 60, 70, 80]);
-        let rgba = super::to_rgba(28, w, h, pitch, &buf).expect("exact total fits");
-        assert_eq!(&rgba[0..4], &[10, 20, 30, 255]);
-        assert_eq!(&rgba[(w * h - 1) * 4..], &[50, 60, 70, 255]);
-
-        // One byte short must return None rather than panicking.
-        assert_eq!(super::to_rgba(28, w, h, pitch, &buf[..total - 1]), None);
-        // Same for decoded float/integer formats (R16G16B16A16_UNORM, 8 B/px).
-        let total16 = (h - 1) * pitch + w * 8;
-        assert!(super::to_rgba(11, w, h, pitch, &vec![0u8; total16]).is_some());
-        assert_eq!(super::to_rgba(11, w, h, pitch, &vec![0u8; total16 - 1]), None);
     }
 }

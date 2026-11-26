@@ -75,10 +75,10 @@ const LEVEL_IIDS: [Iid; 9] = [
         [0x8b, 0xd1, 0xdd, 0x60, 0x46, 0xb9, 0x35, 0x8b],
     ),
     guid(
-        0x9218_e6bb,
-        0xf944,
-        0x4f7e,
-        [0xa7, 0x5c, 0xb1, 0xb2, 0xc7, 0xb7, 0x01, 0xf3],
+        0x728f1fa2,
+        0xea11,
+        0x4a9f,
+        [0x9b, 0x52, 0x9b, 0x42, 0xa4, 0x84, 0xd5, 0xc9],
     ),
     guid(
         0x5405c344,
@@ -399,6 +399,19 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     E_NOTIMPL
 }
 
+/// The host device's state: the console's device is removed when the host's is
+/// (VIctory 13185f5: the default answer, E_NOTIMPL, reads as a lost device).
+extern "system" fn removed_reason(_: This) -> HRESULT {
+    #[cfg(windows)]
+    if let Some(host) = crate::host::host() {
+        // SAFETY: a plain query.
+        if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
+            return e.code().0;
+        }
+    }
+    S_OK
+}
+
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
 /// methods `ID3D12Device1` to `ID3D12Device8` add, in order: 3, 1, 3, 6, 9,
 /// 1, 2, 9 (0x298-0x3a0, the console's own among them), then those of
@@ -431,6 +444,7 @@ static FUNCTIONS: Table<160> = {
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
     f[36] = fence::create as *const (); // 0x120
+    f[37] = removed_reason as *const (); // 0x128
     f[38] = resource::copyable_footprints as *const (); // 0x130
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
@@ -486,21 +500,6 @@ mod tests {
         );
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0xf0);
         assert_eq!(missing(), E_NOTIMPL);
-    }
-
-    #[test]
-    fn device8_uses_the_released_sdk_iid() {
-        let device8 = guid(
-            0x9218_e6bb,
-            0xf944,
-            0x4f7e,
-            [0xa7, 0x5c, 0xb1, 0xb2, 0xc7, 0xb7, 0x01, 0xf3],
-        );
-        assert_eq!(
-            guid_text(&LEVEL_IIDS[7]),
-            "9218e6bb-f944-4f7e-a75c-b1b2c7b701f3"
-        );
-        assert_eq!(create_as(&device8), (S_OK, super::device()));
     }
 
     #[test]

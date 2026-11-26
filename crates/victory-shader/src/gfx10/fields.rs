@@ -235,19 +235,32 @@ impl Instruction {
             }
             Encoding::Sopp => Fields::Sopp { imm: w0 as u16 },
             Encoding::Smem => {
-                let data = match name {
-                    "s_gl1_inv" | "s_dcache_inv" | "s_dcache_wb" => None,
-                    n if n.starts_with("s_dcache_discard") => None,
-                    "s_memtime" | "s_memrealtime" => Some(2),
-                    _ => Some(data_dwords(name)),
+                let sdata = (w0 >> 6 & 0x7F) as u8;
+                // s_atc_probe*: SDATA is a 7-bit immediate, not an SGPR. The
+                // buffer form's resource is 4 dwords. GLC and DLC are not operands.
+                let probe = matches!(name, "s_atc_probe" | "s_atc_probe_buffer");
+                let data = if probe {
+                    Some(Operand::Literal(u32::from(sdata)))
+                } else {
+                    match name {
+                        "s_gl1_inv" | "s_dcache_inv" | "s_dcache_wb" => None,
+                        n if n.starts_with("s_dcache_discard") => None,
+                        "s_memtime" | "s_memrealtime" => Some(scalar(sdata, 2)),
+                        _ => Some(scalar(sdata, data_dwords(name))),
+                    }
                 };
-                let base = 2 + 2 * u8::from(name.starts_with("s_buffer_"));
+                let base =
+                    2 + 2 * u8::from(name.starts_with("s_buffer_") || name == "s_atc_probe_buffer");
                 Fields::Smem {
-                    data: data.map(|d| scalar((w0 >> 6 & 0x7F) as u8, d)),
+                    data,
                     base: scalar(((w0 & 0x3F) << 1) as u8, base),
                     offset: (w1 << 11) as i32 >> 11,
                     soffset: scalar((w1 >> 25) as u8, 1),
-                    cache: cache(bit(w0, 16), false, bit(w0, 14)),
+                    cache: if probe {
+                        Cache::default()
+                    } else {
+                        cache(bit(w0, 16), false, bit(w0, 14))
+                    },
                 }
             }
             Encoding::Vop1 | Encoding::Vop2 | Encoding::Vopc | Encoding::Vop3 | Encoding::Vop3p => {
@@ -300,11 +313,7 @@ impl Instruction {
                             | "ds_gws_sema_release_all"
                     ) {
                     0
-                } else if pair
-                    || name.contains("cmpst")
-                    || name.contains("mskor")
-                    || name.contains("wrap")
-                {
+                } else if pair || name.contains("cmpst") || name.contains("mskor") {
                     2
                 } else {
                     1
@@ -393,8 +402,7 @@ impl Instruction {
                 let (load, atomic) = (name.contains("_load_"), name.contains("_atomic_"));
                 let addr = match self.encoding {
                     Encoding::Flat => Some(vector(w1 & 0xFF, 2)),
-                    Encoding::Global => (!name.contains("addtid"))
-                        .then(|| vector(w1 & 0xFF, 1 + u8::from(saddr == NULL))),
+                    Encoding::Global => Some(vector(w1 & 0xFF, 1 + u8::from(saddr == NULL))),
                     // With an SGPR base, scratch takes no VGPR.
                     _ => (saddr == NULL).then(|| vector(w1 & 0xFF, 1)),
                 };
@@ -410,6 +418,8 @@ impl Instruction {
                     saddr: (self.encoding != Encoding::Flat)
                         .then(|| scalar(saddr, 1 + u8::from(self.encoding == Encoding::Global))),
                     offset: match self.encoding {
+                        // GFX10 FLAT offsets are 11-bit and unsigned: the
+                        // hardware ignores bit 11.
                         Encoding::Flat => (w0 & 0x7FF) as i16,
                         _ => ((w0 << 4) as i16) >> 4,
                     },
@@ -594,10 +604,7 @@ impl Instruction {
                     }
                 }
                 let vdst = w0 & 0xFF;
-                v.dst = Some(if name.starts_with("v_cmpx") {
-                    // CMPX ignores VDST and writes EXEC only.
-                    scalar(EXEC, lanes)
-                } else if compare {
+                v.dst = Some(if compare {
                     scalar(vdst as u8, lanes)
                 } else {
                     valu_dst(name, vdst, dst_n)
@@ -800,7 +807,6 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
         _ => {}
     }
     let (mut whole, mut derivs, mut packed): (u8, u8, u8) = (0, 0, coords);
-    let mut g16 = false;
     if let Some(rest) = name
         .strip_prefix("image_sample")
         .or_else(|| name.strip_prefix("image_gather4"))
@@ -810,135 +816,15 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
                 "o" | "b" | "c" => whole += 1,
                 "d" | "cd" => derivs = grads,
                 "l" | "cl" => packed += 1,
-                "g16" => g16 = true,
                 _ => {}
             }
         }
     } else if name.contains("_mip") {
         packed += 1;
     }
-    let grad_dwords = if a16 || g16 {
-        2 * derivs.div_ceil(2)
+    if a16 {
+        whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
     } else {
-        2 * derivs
-    };
-    let coord_dwords = if a16 { packed.div_ceil(2) } else { packed };
-    whole + grad_dwords + coord_dwords
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn image_sample_g16_packs_gradients_without_a16() {
-        // Non-g16 `image_sample_d`: 32-bit gradients unless a16 is set.
-        assert_eq!(image_addr_dwords("image_sample_d", 1, false), 6); // 2D: 4 grads + 2 coords
-        assert_eq!(image_addr_dwords("image_sample_d", 2, false), 9); // 3D: 6 grads + 3 coords
-        assert_eq!(image_addr_dwords("image_sample_d", 3, false), 7); // Cube: 4 grads + 3 coords
-        assert_eq!(image_addr_dwords("image_sample_d", 1, true), 3); // 2D a16: 2 grads + 1 coord
-
-        // RDNA2 `_g16` opcodes always pack gradients as 16-bit pairs even when a16=false.
-        assert_eq!(image_addr_dwords("image_sample_d_g16", 0, false), 3); // 1D: 2 + 1
-        assert_eq!(image_addr_dwords("image_sample_d_g16", 1, false), 4); // 2D: 2 + 2
-        assert_eq!(image_addr_dwords("image_sample_d_g16", 2, false), 7); // 3D: 4 + 3
-        assert_eq!(image_addr_dwords("image_sample_d_g16", 3, false), 5); // Cube: 2 + 3
-        assert_eq!(image_addr_dwords("image_sample_d_g16", 5, false), 5); // 2D_ARRAY: 2 + 3
-        assert_eq!(image_addr_dwords("image_sample_c_d_cl_o_g16", 1, false), 7); // 2D: o(1)+c(1)+grads(2)+coords+cl(3)
-        assert_eq!(image_addr_dwords("image_sample_c_d_cl_o_g16", 1, true), 6); // 2D a16: o(1)+c(1)+grads(2)+ceil(3/2)(2)
-
-        // End-to-end MIMG decode for 2D `image_sample_d_g16` (opcode 0x0a2: low 7 bits in
-        // w0[24:18], bit 7 in w0[0]; dim=1, a16=false):
-        // Sequential mode (nsaddr=0) decodes 4 consecutive address VGPRs, not 6.
-        let w0_seq: u32 = (0x3C << 26) | ((0x0a2 & 0x7F) << 18) | (0xF << 8) | (1 << 3) | 1;
-        let w1: u32 = (4 << 8) | 10; // vdst=v4, vaddr=v10, a16=0
-        let seq_bytes: Vec<u8> = [w0_seq, w1, 0xBF81_0000]
-            .into_iter()
-            .flat_map(u32::to_le_bytes)
-            .collect();
-        let inst = crate::gfx10::decode(&seq_bytes).unwrap().remove(0);
-        assert_eq!(inst.name(), Some("image_sample_d_g16"));
-        let Fields::Image { addr, .. } = inst.fields(false) else {
-            panic!("expected Fields::Image");
-        };
-        assert_eq!(
-            addr,
-            vec![Operand::Vector {
-                reg: 10,
-                dwords: 4
-            }]
-        );
-
-        // NSA mode (nsaddr=1 -> 1 extra dword w2 carrying VGPRs 11, 12, 13):
-        // Must decode exactly 4 VGPRs (v10, v11, v12, v13) without reading past words.len() into v0.
-        let w0_nsa = w0_seq | (1 << 1);
-        let w2_nsa: u32 = 11 | (12 << 8) | (13 << 16);
-        let nsa_bytes: Vec<u8> = [w0_nsa, w1, w2_nsa, 0xBF81_0000]
-            .into_iter()
-            .flat_map(u32::to_le_bytes)
-            .collect();
-        let inst = crate::gfx10::decode(&nsa_bytes).unwrap().remove(0);
-        assert_eq!(inst.name(), Some("image_sample_d_g16"));
-        let Fields::Image { addr, .. } = inst.fields(false) else {
-            panic!("expected Fields::Image");
-        };
-        assert_eq!(
-            addr,
-            vec![
-                Operand::Vector { reg: 10, dwords: 1 },
-                Operand::Vector { reg: 11, dwords: 1 },
-                Operand::Vector { reg: 12, dwords: 1 },
-                Operand::Vector { reg: 13, dwords: 1 },
-            ]
-        );
-    }
-
-    use crate::gfx10::decode;
-    use crate::ir::{self, Reg};
-
-    #[test]
-    fn ds_wrap_rtn_decodes_both_data_operands_and_global_addtid_has_no_vaddr() {
-        const S_ENDPGM: u32 = 0xBF81_0000;
-        // ds_wrap_rtn_b32 v3, v0, v1, v2
-        let ds_wrap = [0xD8D0_0000u32, 0x0302_0100, S_ENDPGM];
-        let bytes: Vec<u8> = ds_wrap.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let insts = decode(&bytes).unwrap();
-        assert_eq!(insts[0].name(), Some("ds_wrap_rtn_b32"));
-        match insts[0].fields(false) {
-            Fields::Ds { dst, addr, data, .. } => {
-                assert_eq!(dst, Some(Operand::Vector { reg: 3, dwords: 1 }));
-                assert_eq!(addr, Some(Operand::Vector { reg: 0, dwords: 1 }));
-                assert_eq!(
-                    data,
-                    vec![
-                        Operand::Vector { reg: 1, dwords: 1 },
-                        Operand::Vector { reg: 2, dwords: 1 },
-                    ]
-                );
-            }
-            other => panic!("expected Fields::Ds, got {other:?}"),
-        }
-        let p = ir::build(&bytes, false, 16).unwrap();
-        assert!(p.blocks[0].insts[0].read(Reg::V(1)).is_some());
-        assert!(p.blocks[0].insts[0].read(Reg::V(2)).is_some());
-
-        // global_load_dword_addtid v3, s[4:5] and global_store_dword_addtid v2, s[4:5]
-        let addtid = [
-            0xDC58_8000u32,
-            0x0304_0000, // global_load_dword_addtid v3, s[4:5]
-            0xDC5C_8000,
-            0x0004_0200, // global_store_dword_addtid v2, s[4:5]
-            S_ENDPGM,
-        ];
-        let bytes: Vec<u8> = addtid.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let insts = decode(&bytes).unwrap();
-        assert_eq!(insts[0].name(), Some("global_load_dword_addtid"));
-        assert_eq!(insts[1].name(), Some("global_store_dword_addtid"));
-        assert!(matches!(insts[0].fields(false), Fields::Flat { addr: None, .. }));
-        assert!(matches!(insts[1].fields(false), Fields::Flat { addr: None, .. }));
-        let p = ir::build(&bytes, false, 16).unwrap();
-        // Neither instruction fabricates a read of v0.
-        assert!(p.blocks[0].insts[0].read(Reg::V(0)).is_none());
-        assert!(p.blocks[0].insts[1].read(Reg::V(0)).is_none());
+        whole + 2 * derivs + packed
     }
 }

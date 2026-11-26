@@ -3,7 +3,8 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, 'sync/**']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -44,3 +45,11 @@ jobs:
           if ($samples.Count -ne 2 -or $samples[1].pid -ne $PID -or
               $null -ne $samples[0].data.process.cpu_cores -or $null -eq $samples[1].data.process.cpu_cores -or
               $samples[1].data.process.working_set_bytes -le 0) { throw 'Invalid process samples' }
+      - name: Build release binary
+        run: cargo build --release --locked -p victory
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: human-windows-x64
+          path: target/release/victory.exe
+          if-no-files-found: error

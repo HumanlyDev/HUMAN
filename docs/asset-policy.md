@@ -28,7 +28,7 @@ In any form (files, string literals, fixtures, snapshots, docs):
 `crates/victory-formats/src/bcpack-tables.bin` (about 78 KB): the constant
 tables of the BCPack format (entropy models, index rank tables, control
 codes, per-format dictionaries). A BCPack stream cannot be decoded without
-exactly these tables and they cannot be derived, so they ship with this project
+exactly these tables and they cannot be derived, so they ship with VIctory
 by the project owner's decision (2026-11-23), entered as an exception in
 `xtask/src/policy.rs`. They are part of the format, not our work, and the
 repository's licence does not cover them. Nothing else of this kind is
@@ -45,7 +45,7 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
 1. `.gitignore` keeps common data types out of `git status`.
 2. `cargo xtask policy` (run by the pre-commit hook; install with
    `cargo xtask install-hooks`) is an allowlist: files must have an allowed
-   type, be under 1 MiB, contain no binary data or known binary
+   type, be under 640 KiB, contain no binary data or known binary
    signatures, and hold no long hex/base64 runs. Exceptions need an entry
    with a reason in `xtask/src/policy.rs`.
 3. At runtime, everything that writes derived data calls

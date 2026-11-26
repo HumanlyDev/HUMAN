@@ -78,7 +78,21 @@ impl HostPolicy {
         if !self.allows(dll) {
             return None;
         }
-        imp::resolve(dll, symbol)
+        let address = imp::resolve(dll, symbol)?;
+        // The title's copies of memory look where they write.
+        #[cfg(windows)]
+        if let ImportSymbol::Name { name, .. } = symbol {
+            let ours = victory_gpu::titlewrite::import(name, address);
+            if ours != address {
+                return Some(ours);
+            }
+        }
+        // With a timeline asked for, what threads wait with is wrapped.
+        #[cfg(all(windows, feature = "diagnostics"))]
+        if let ImportSymbol::Name { name, .. } = symbol {
+            return Some(victory_gpu::timeline::import(name, address));
+        }
+        Some(address)
     }
 }
 
@@ -99,7 +113,6 @@ mod imp {
     use std::sync::{LazyLock, Mutex};
 
     use victory_pe::ImportSymbol;
-    use windows_sys::Win32::Foundation::FreeLibrary;
     use windows_sys::Win32::System::LibraryLoader::{
         GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExA,
     };
@@ -121,97 +134,114 @@ mod imp {
         proc.map(|f| f as *const () as usize)
     }
 
-    /// Resolves and caches a module handle without holding `cache` across
-    /// `load` (calling `LoadLibraryExA` under `MODULES` would invert lock order
-    /// with the Windows OS loader lock and self-deadlock on re-entrant hooks).
-    fn module_with(
-        cache: &Mutex<HashMap<String, usize>>,
-        dll: &str,
-        load: impl FnOnce(&str) -> usize,
-        free: impl FnOnce(usize),
-    ) -> Option<usize> {
-        let key = dll.to_ascii_lowercase();
-        if let Some(&m) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-            return Some(m);
-        }
-        let handle = load(&key);
-        if handle == 0 {
-            return None;
-        }
-        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        let chosen = *guard.entry(key).or_insert(handle);
-        drop(guard);
-        if chosen != handle {
-            free(handle);
-        }
-        Some(chosen)
-    }
-
     fn module(dll: &str) -> Option<usize> {
-        module_with(
-            &MODULES,
-            dll,
-            |key| {
-                let Ok(name) = CString::new(key) else {
-                    return 0;
-                };
-                // System32 only: never pick up a same-named DLL from the current folder or PATH.
-                // SAFETY: NUL-terminated DLL name; only allow-listed system DLLs get here.
-                let handle = unsafe {
-                    LoadLibraryExA(
-                        name.as_ptr().cast(),
-                        std::ptr::null_mut(),
-                        LOAD_LIBRARY_SEARCH_SYSTEM32,
-                    )
-                };
-                handle as usize
-            },
-            |handle| {
-                // SAFETY: redundant handle from `LoadLibraryExA` after another thread populated the slot.
-                unsafe { FreeLibrary(handle as _) };
-            },
-        )
+        let key = dll.to_ascii_lowercase();
+        let cache = || MODULES.lock().unwrap_or_else(|e| e.into_inner());
+        let cached = cache().get(&key).copied();
+        if cached.is_some() {
+            return cached;
+        }
+        let name = CString::new(key.as_str()).ok()?;
+        // Not under the cache's lock: loading takes the OS loader lock, and
+        // title code that runs under that one (a DLL's thread attach, a TLS
+        // callback) may look a function up here.
+        // System32 only: never pick up a same-named DLL from the current folder or PATH.
+        // SAFETY: NUL-terminated DLL name; only allow-listed system DLLs get here.
+        let handle = unsafe {
+            LoadLibraryExA(
+                name.as_ptr().cast(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        } as usize;
+        // A thread that loaded it meanwhile got the same module, which stays loaded.
+        (handle != 0).then(|| *cache().entry(key).or_insert(handle))
     }
 
     #[cfg(test)]
     mod tests {
-        use super::*;
+        use std::ffi::c_void;
+        use std::ptr::{null, null_mut};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
 
+        use windows_sys::Win32::System::Threading::{
+            CreateThread, INFINITE, Sleep, WaitForSingleObject,
+        };
+
+        const CHILD: &str = "VICTORY_HOST_LOCK_CHILD";
+        static ARMED: AtomicBool = AtomicBool::new(false);
+        static IN_ATTACH: AtomicBool = AtomicBool::new(false);
+        static STARTED: AtomicBool = AtomicBool::new(false);
+
+        /// Runs as title TLS callbacks do: under the loader lock, as a new
+        /// thread starts.
+        #[used]
+        #[unsafe(link_section = ".CRT$XLY")]
+        static ON_THREAD: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = attach;
+
+        unsafe extern "system" fn attach(_: *mut c_void, reason: u32, _: *mut c_void) {
+            const DLL_THREAD_ATTACH: u32 = 2;
+            if reason == DLL_THREAD_ATTACH && ARMED.swap(false, Ordering::SeqCst) {
+                IN_ATTACH.store(true, Ordering::SeqCst);
+                // SAFETY: a plain sleep, for the other thread to start a load.
+                unsafe { Sleep(500) };
+                let found = super::super::function("kernel32.dll", "GetTickCount");
+                assert!(found.is_some());
+            }
+        }
+
+        unsafe extern "system" fn idle(_: *mut c_void) -> u32 {
+            0
+        }
+
+        /// One thread loads a DLL nothing has loaded yet, which needs the
+        /// loader lock, while another thread's attach holds that lock and
+        /// looks a function up. Run in a child process: a deadlock inside the
+        /// loader keeps a process from exiting, so the parent kills it.
         #[test]
-        fn module_with_releases_lock_during_load_and_frees_raced_duplicate() {
-            let cache: Mutex<HashMap<String, usize>> = Mutex::default();
-            cache.lock().unwrap().insert("already.dll".into(), 0x1111);
-
-            // Re-entrant lookup during `load` must not deadlock.
-            let mut freed = Vec::new();
-            let got = module_with(
-                &cache,
-                "Fresh.DLL",
-                |_| {
-                    assert_eq!(
-                        module_with(&cache, "already.dll", |_| unreachable!(), |_| unreachable!()),
-                        Some(0x1111)
-                    );
-                    0x2222
-                },
-                |h| freed.push(h),
-            );
-            assert_eq!(got, Some(0x2222));
-            assert!(freed.is_empty());
-
-            // If another thread inserts the same key while `load` runs, return
-            // the existing handle and free the redundant newly loaded handle.
-            let got = module_with(
-                &cache,
-                "Raced.DLL",
-                |k| {
-                    cache.lock().unwrap().insert(k.to_owned(), 0x3333);
-                    0x4444
-                },
-                |h| freed.push(h),
-            );
-            assert_eq!(got, Some(0x3333));
-            assert_eq!(freed, vec![0x4444]);
+        fn loading_a_host_dll_does_not_block_thread_attach() {
+            if std::env::var_os(CHILD).is_none() {
+                let name = "host::imp::tests::loading_a_host_dll_does_not_block_thread_attach";
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", name])
+                    .env(CHILD, "1")
+                    .spawn()
+                    .unwrap();
+                let start = Instant::now();
+                loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        assert!(status.success());
+                        return;
+                    }
+                    if start.elapsed() > Duration::from_secs(30) {
+                        child.kill().unwrap();
+                        panic!("deadlock: a host DLL loads under the module cache's lock");
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            // The attach below only needs the cache, no load of its own.
+            assert!(super::super::function("kernel32.dll", "GetTickCount").is_some());
+            let loader = std::thread::spawn(|| {
+                STARTED.store(true, Ordering::SeqCst);
+                while !IN_ATTACH.load(Ordering::SeqCst) {
+                    std::hint::spin_loop();
+                }
+                super::super::function("cabinet.dll", "FDICreate")
+            });
+            // Its own attach is over: the next is the thread below.
+            while !STARTED.load(Ordering::SeqCst) {
+                std::hint::spin_loop();
+            }
+            ARMED.store(true, Ordering::SeqCst);
+            let (security, start) = (std::ptr::null(), Some(idle as _));
+            // SAFETY: a thread that returns at once.
+            let thread = unsafe { CreateThread(security, 0, start, null(), 0, null_mut()) };
+            assert!(!thread.is_null());
+            assert!(loader.join().unwrap().is_some());
+            // SAFETY: our own thread's handle.
+            unsafe { WaitForSingleObject(thread, INFINITE) };
         }
     }
 }

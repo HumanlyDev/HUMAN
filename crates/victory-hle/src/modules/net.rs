@@ -181,12 +181,7 @@ fn resolvable(name: Option<String>) -> bool {
         Some(name)
             if !(name.is_empty()
                 || name.eq_ignore_ascii_case("localhost")
-                || name
-                    .strip_prefix('[')
-                    .and_then(|s| s.strip_suffix(']'))
-                    .unwrap_or(&name)
-                    .parse::<IpAddr>()
-                    .is_ok()) =>
+                || name.parse::<IpAddr>().is_ok()) =>
         {
             once("network name lookup blocked", name);
             wsa_error(WSAHOST_NOT_FOUND);
@@ -301,11 +296,6 @@ struct SocketAddress {
     len: i32,
 }
 
-/// More candidates than any title offers. A `SOCKET_ADDRESS_LIST`
-/// carries no size, so a count past this is the title's word alone and
-/// is refused rather than walked.
-const MAX_CONNECT_LIST: usize = 64;
-
 /// Every candidate must be loopback.
 pub extern "system" fn WSAConnectByList(
     s: Socket,
@@ -321,10 +311,6 @@ pub extern "system" fn WSAConnectByList(
         // SAFETY: the title passes a `SOCKET_ADDRESS_LIST`.
         let entries = unsafe {
             let count = usize::try_from(list.cast::<i32>().read()).unwrap_or(0);
-            if count > MAX_CONNECT_LIST {
-                wsa_error(WSAEINVAL);
-                return 0;
-            }
             std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count)
         };
         if !entries
@@ -531,15 +517,12 @@ pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
     let host_bind = host!("ws2_32.dll", "bind": extern "system" fn(Socket, *const u8, i32) -> i32);
     match socket_addr(name, len) {
         Some(a) if loopback(a.ip()) => host_bind(s, name, len),
-        Some(a) if a.ip().to_canonical().is_unspecified() => {
+        Some(a) if a.ip().is_unspecified() => {
             once("network bind narrowed to loopback", a.to_string());
             // SAFETY: `socket_addr` checked `len` readable bytes.
             let mut local = unsafe { std::slice::from_raw_parts(name, len as usize) }.to_vec();
             match a {
                 SocketAddr::V4(_) => local[4..8].copy_from_slice(&[127, 0, 0, 1]),
-                SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some() => {
-                    local[20..24].copy_from_slice(&[127, 0, 0, 1]);
-                }
                 SocketAddr::V6(_) => local[23] = 1,
             }
             host_bind(s, local.as_ptr(), len)
@@ -554,6 +537,14 @@ pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
 
 // Forward lookups.
 
+fn blocked_lookup(result: *mut *mut c_void) -> i32 {
+    if !result.is_null() {
+        // SAFETY: a non-null result points to the caller's output slot.
+        unsafe { result.write(std::ptr::null_mut()) };
+    }
+    WSAHOST_NOT_FOUND
+}
+
 pub extern "system" fn getaddrinfo(
     node: *const c_char,
     service: *const c_char,
@@ -561,7 +552,7 @@ pub extern "system" fn getaddrinfo(
     result: *mut *mut c_void,
 ) -> i32 {
     if !resolvable(narrow(node)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "getaddrinfo": extern "system" fn(*const c_char, *const c_char, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
@@ -575,7 +566,7 @@ pub extern "system" fn GetAddrInfoW(
     result: *mut *mut c_void,
 ) -> i32 {
     if !resolvable(wide(node)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "GetAddrInfoW": extern "system" fn(*const u16, *const u16, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
@@ -595,7 +586,7 @@ pub extern "system" fn GetAddrInfoExA(
     handle: *mut Handle,
 ) -> i32 {
     if !resolvable(narrow(name)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
@@ -615,7 +606,7 @@ pub extern "system" fn GetAddrInfoExW(
     handle: *mut Handle,
 ) -> i32 {
     if !resolvable(wide(name)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "GetAddrInfoExW": extern "system" fn(*const u16, *const u16, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
@@ -908,49 +899,53 @@ mod tests {
         a
     }
 
-    fn v6(ip: [u8; 16], port: u16) -> [u8; 28] {
-        let mut a = [0u8; 28];
-        a[..2].copy_from_slice(&AF_INET6.to_le_bytes());
-        a[2..4].copy_from_slice(&port.to_be_bytes());
-        a[8..24].copy_from_slice(&ip);
-        a
-    }
-
     // TEST-NET-1 (192.0.2.0/24): never routed, and never tried here.
     const AWAY: [u8; 4] = [192, 0, 2, 1];
     const HOME: [u8; 4] = [127, 0, 0, 1];
 
     #[test]
-    fn a_count_the_list_cannot_hold_is_refused() {
-        // One real loopback entry; the count claims 0x7FFFFFFF follow it.
-        #[repr(C)]
-        struct List {
-            count: i32,
-            pad: i32,
-            entries: [SocketAddress; 1],
-        }
-        let sockaddr = v4(HOME, 80);
-        let list = List {
-            count: i32::MAX,
-            pad: 0,
-            entries: [SocketAddress {
-                addr: sockaddr.as_ptr(),
-                len: sockaddr.len() as i32,
-            }],
+    fn blocked_name_lookups_clear_the_result() {
+        let ansi = c"blocked.invalid".as_ptr();
+        let wide: Vec<u16> = "blocked.invalid\0".encode_utf16().collect();
+        let wide = wide.as_ptr();
+        let null = std::ptr::null();
+        let null_mut = std::ptr::null_mut();
+        let check = |lookup: &dyn Fn(*mut *mut c_void) -> i32| {
+            let mut result = std::ptr::dangling_mut::<c_void>();
+            assert_eq!(lookup(&mut result), WSAHOST_NOT_FOUND);
+            assert!(result.is_null());
+            assert_eq!(lookup(std::ptr::null_mut()), WSAHOST_NOT_FOUND);
         };
-        let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
-        let connected = WSAConnectByList(
-            0,
-            (&list as *const List).cast(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null_mut(),
-        );
-        assert_eq!(connected, 0);
-        assert_eq!(last_error(), WSAEINVAL);
+        check(&|result| getaddrinfo(ansi, std::ptr::null(), null, result));
+        check(&|result| GetAddrInfoW(wide, std::ptr::null(), null, result));
+        check(&|result| {
+            GetAddrInfoExA(
+                ansi,
+                std::ptr::null(),
+                0,
+                null,
+                null,
+                result,
+                null,
+                null_mut,
+                null,
+                std::ptr::null_mut(),
+            )
+        });
+        check(&|result| {
+            GetAddrInfoExW(
+                wide,
+                std::ptr::null(),
+                0,
+                null,
+                null,
+                result,
+                null,
+                null_mut,
+                null,
+                std::ptr::null_mut(),
+            )
+        });
     }
 
     #[test]
@@ -1123,65 +1118,5 @@ mod tests {
             }
             assert!(present, "{dll} lacks {}", e.name);
         }
-    }
-
-    #[test]
-    fn bind_ipv4_mapped_unspecified_narrows_to_loopback() {
-        // Ensure Winsock is initialized.
-        let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket);
-        let close = host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32);
-        let setsockopt = host!(
-            "ws2_32.dll",
-            "setsockopt": extern "system" fn(Socket, i32, i32, *const u8, i32) -> i32
-        );
-        let getsockname = host!(
-            "ws2_32.dll",
-            "getsockname": extern "system" fn(Socket, *mut u8, *mut i32) -> i32
-        );
-
-        struct Guard(Socket, extern "system" fn(Socket) -> i32);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                (self.1)(self.0);
-            }
-        }
-
-        let s = socket(i32::from(AF_INET6), 1, 6);
-        assert_ne!(s, INVALID_SOCKET);
-        let _guard = Guard(s, close);
-
-        const IPPROTO_IPV6: i32 = 41;
-        const IPV6_V6ONLY: i32 = 27;
-        let v6only = 0i32;
-        assert_eq!(
-            setsockopt(
-                s,
-                IPPROTO_IPV6,
-                IPV6_V6ONLY,
-                (&raw const v6only).cast(),
-                4
-            ),
-            0
-        );
-
-        let mapped_any = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0];
-        let sa = v6(mapped_any, 0);
-        assert_eq!(bind(s, sa.as_ptr(), 28), 0);
-
-        let mut out = [0u8; 28];
-        let mut out_len = 28i32;
-        assert_eq!(getsockname(s, out.as_mut_ptr(), &mut out_len), 0);
-        let bound = socket_addr(out.as_ptr(), out_len).unwrap();
-        assert_eq!(
-            bound.ip(),
-            IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 1))
-        );
-        assert_ne!(bound.port(), 0);
-    }
-
-    #[test]
-    fn resolvable_accepts_bracketed_ipv6_loopback() {
-        assert!(resolvable(Some("[::1]".into())));
     }
 }

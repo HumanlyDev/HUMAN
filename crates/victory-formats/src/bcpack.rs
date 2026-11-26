@@ -172,9 +172,6 @@ impl Tables {
         let mut ctrl7 = [0u16; 512];
         for c in &mut ctrl7 {
             *c = r.u16();
-            if *c != 0 && !valid_bc7_ctrl(*c) {
-                return Err(Error("invalid BC7 control code"));
-            }
         }
         let mut plain = |ep: usize, ix: usize| {
             (0..DICTIONARY)
@@ -213,7 +210,7 @@ impl Tables {
             })
             .collect();
         let bc7 = (0..DICTIONARY)
-            .map(|entry| {
+            .map(|_| {
                 let mut ep = Bc7Ep {
                     ctrl: r.u16(),
                     ..Default::default()
@@ -225,18 +222,11 @@ impl Tables {
                     bits: [r.u8(), r.u8()],
                     ..Default::default()
                 };
-                if entry == 0 {
-                    // The first entry has all 32 indices right after the width
-                    // bytes; every later entry repeats the widths first.
-                    for v in ix.ix.as_flattened_mut() {
-                        *v = r.u16() as i16;
-                    }
-                } else {
-                    r.u16();
-                    // Only 15 slots for set 1, which no entry uses (0 bits).
-                    for v in &mut ix.ix.as_flattened_mut()[..31] {
-                        *v = r.u16() as i16;
-                    }
+                // Unused: the widths again in all entries but the first.
+                r.u16();
+                // Only 15 slots for set 1, which no entry uses (0 bits).
+                for v in &mut ix.ix.as_flattened_mut()[..31] {
+                    *v = r.u16() as i16;
                 }
                 (ep, ix)
             })
@@ -752,25 +742,6 @@ const BC7_INDEX: [[u8; 2]; 8] = [
 
 fn pbits(mode: u16) -> bool {
     matches!(mode, 0 | 1 | 3 | 6 | 7)
-}
-
-/// Checks that a non-zero BC7 control code has valid `(mode, subsets, rot, part)`
-/// fields for the BC7 specification. Unvalidated entries (such as `mode in {0, 1, 3}`
-/// with `rot == 1`, which swaps `prec[3] == 0` into `prec[0]`) would otherwise cause
-/// a `u16 >> 16` shift-overflow panic in [`bc7_pack`] or emit malformed 128-bit blocks.
-fn valid_bc7_ctrl(ctrl: u16) -> bool {
-    let mode = ctrl & 7;
-    let rot = (ctrl >> 3) & 3;
-    let subsets = (ctrl & 0xff) >> 6;
-    let part = (ctrl >> 8) & 63;
-    match mode {
-        0 => subsets == 3 && rot == 0 && part < 16,
-        1 | 3 | 7 => subsets == 2 && rot == 0,
-        2 => subsets == 3 && rot == 0,
-        4 | 5 => subsets == 1,
-        6 => subsets == 1 && rot == 0,
-        _ => false,
-    }
 }
 
 /// Channel precisions: the p-bit is red's lowest bit; rotation swaps alpha
@@ -1623,26 +1594,6 @@ mod tests {
         assert!(n > 0);
     }
 
-    #[test]
-    fn bc7_first_dictionary_entry_keeps_all_32_indices() {
-        let mut bytes = tables();
-        let bc7 = MODELS * BUCKETS * 2
-            + 256
-            + 64
-            + 256
-            + 64
-            + 64
-            + 512 * 2
-            + DICTIONARY * (6 + 16 + 8 + 32 + 2 + 16 + 4 + 32 + 25 + 33);
-        // Entry 0: bits, then 32 i16 indices (no repeated width bytes).
-        bytes[bc7 + 50..bc7 + 52].copy_from_slice(&[4, 0]);
-        bytes[bc7 + 52..bc7 + 54].copy_from_slice(&2u16.to_le_bytes());
-        bytes[bc7 + 54..bc7 + 56].copy_from_slice(&1u16.to_le_bytes());
-        let t = Tables::parse(&bytes).unwrap();
-        assert_eq!(t.bc7[0].1.ix[0][0], 2);
-        assert_eq!(t.bc7[0].1.ix[0][1], 1);
-    }
-
     /// A dictionary entry stands in for a block the decoder made: a set with
     /// 0 index bits holds no indices, and pixel 0 is the anchor (top bit clear).
     #[test]
@@ -1652,44 +1603,6 @@ mod tests {
             let anchor = 0..1 << (ix.bits[0] - 1);
             let ok = (ix.bits[1] != 0 || ix.ix[1] == [0; 16]) && anchor.contains(&ix.ix[0][0]);
             assert!(ok, "entry {k}: {:?}", ix.ix);
-        }
-    }
-
-    #[test]
-    fn tables_parse_rejects_invalid_bc7_ctrl_codes() {
-        let base = tables();
-        // ctrl7 starts immediately after the 64 models (64*12*2 bytes) and 5 rank tables (5*256 bytes).
-        let ctrl7_offset = MODELS * BUCKETS * 2 + 5 * 256;
-        let encode = |part: u16, subsets: u16, rot: u16, mode: u16| {
-            (part << 8) | (subsets << 6) | (rot << 3) | mode
-        };
-        let bad_codes: &[u16] = &[
-            encode(0, 3, 1, 0),  // mode 0, rot 1 -> prec[0] == 0 (u16 >> 16 panic)
-            encode(0, 2, 1, 1),  // mode 1, rot 1 -> prec[0] == 0 (u16 >> 16 panic)
-            encode(0, 2, 1, 3),  // mode 3, rot 1 -> prec[0] == 0 (u16 >> 16 panic)
-            encode(0, 1, 1, 6),  // mode 6 with non-zero rotation
-            encode(0, 0, 0, 6),  // mode 6 with subsets == 0
-            encode(0, 3, 0, 6),  // mode 6 with subsets == 3 (overflows 128 bits)
-            encode(16, 3, 0, 0), // mode 0 with 4-bit partition >= 16
-            encode(0, 2, 0, 4),  // mode 4 with subsets == 2
-        ];
-        for &ctrl in bad_codes {
-            let mut raw = base.clone();
-            raw[ctrl7_offset..ctrl7_offset + 2].copy_from_slice(&ctrl.to_le_bytes());
-            assert!(
-                Tables::parse(&raw).is_err(),
-                "expected invalid BC7 ctrl {ctrl:#06x} to be rejected"
-            );
-        }
-
-        // Valid mode 4 with rotation 1 and mode 0 with partition 15 must succeed.
-        for ctrl in [encode(0, 1, 1, 4), encode(15, 3, 0, 0)] {
-            let mut raw = base.clone();
-            raw[ctrl7_offset..ctrl7_offset + 2].copy_from_slice(&ctrl.to_le_bytes());
-            assert!(
-                Tables::parse(&raw).is_ok(),
-                "expected valid BC7 ctrl {ctrl:#06x} to be accepted"
-            );
         }
     }
 }

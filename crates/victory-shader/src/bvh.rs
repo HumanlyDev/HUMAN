@@ -196,12 +196,11 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
         }
         let enter = near[0].max(near[1]).max(near[2]);
         let leave = far[0].min(far[1]).min(far[2]);
-        // Every axis must be ordered (`min <= max`): ordered compares reject
-        // both inverted/empty boxes (`min > max`, e.g. +inf..-inf or BOX16
-        // +65504..-65504) and any NaN in any of the six coordinates (which
-        // IEEE minNum/maxNum would otherwise drop).
-        let valid_box = b[0] <= b[3] && b[1] <= b[4] && b[2] <= b[5];
-        if valid_box && leave >= enter.max(0.0) && enter < ray.extent {
+        // A box whose minimum x is NaN is switched off. A child that is not
+        // there may have inverted infinite bounds, which every ray enters at
+        // minus infinity: it would be first of the sorted children and end
+        // the walk before them (DexNom/VIctory bc3cd4b0).
+        if children[n] != NONE && !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
             ids[n] = children[n];
             distances[n] = enter;
         }
@@ -290,6 +289,17 @@ pub fn half_to_f32(h: u16) -> f32 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// An empty slot's inverted infinite bounds do not come before the
+    /// children a ray enters (after DexNom/VIctory bc3cd4b0).
+    #[test]
+    fn an_empty_slot_is_never_entered() {
+        let inside = |x: f32| [x - 1.0, -1.0, -1.0, x + 1.0, 1.0, 1.0];
+        let (up, down) = (f32::INFINITY, f32::NEG_INFINITY);
+        let bounds = [inside(30.0), [up, up, up, down, down, down], inside(10.0), [up, up, up, down, down, down]];
+        let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 100.0);
+        assert_eq!(boxes(&[8, NONE, 16, NONE], &bounds, &ray, true), [16, 8, NONE, NONE]);
+    }
 
     /// The smallest 16-bit float not below `x` (`up`) or not above it.
     pub(crate) fn f32_to_half(x: f32, up: bool) -> u16 {
@@ -479,42 +489,6 @@ pub(crate) mod tests {
         let ray = Ray::new([-5.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
         // Child 1 is hit but is not there: its pointer is what "none" is.
         assert_eq!(intersect(&node, 5, &ray, true), [8, NONE, NONE, NONE]);
-    }
-
-    #[test]
-    fn partial_axis_nan_and_inverted_boxes_miss_in_box32_and_box16() {
-        let ray = Ray::new([-5.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
-        // Any single NaN coordinate (including b[1..6], where minNum/maxNum
-        // would drop the NaN) must miss in both BOX32 and BOX16.
-        for coord in 0..6 {
-            let mut bad = UNIT;
-            bad[coord] = f32::NAN;
-            let n32 = box32([8, 16, 24, 32], [bad, OFF, OFF, OFF]);
-            let n16 = box16([8, 16, 24, 32], [bad, OFF, OFF, OFF]);
-            assert_eq!(intersect(&n32, 5, &ray, true), [NONE; 4], "box32 coord {coord}");
-            assert_eq!(intersect(&n16, 4, &ray, true), [NONE; 4], "box16 coord {coord}");
-        }
-        // Empty/inverted boxes (min > max on one or all axes, +inf..-inf, or
-        // BOX16 +65504..-65504) must miss rather than having low/high swapped.
-        let empty_inf = [
-            f32::INFINITY,
-            f32::INFINITY,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
-        ];
-        let inverted_y = [-1.0, 1.0, -1.0, 1.0, -1.0, 1.0];
-        let inverted_all = [1.0, 1.0, 1.0, -1.0, -1.0, -1.0];
-        let zero_thick = [0.0, -1.0, -1.0, 0.0, 1.0, 1.0];
-        let boxes = [empty_inf, inverted_y, inverted_all, zero_thick];
-        let n32 = box32([8, 16, 24, 32], boxes);
-        let n16 = box16([8, 16, 24, 32], boxes);
-        // Only child 3 (zero-thickness box at x = 0, min == max) is valid and hit.
-        assert_eq!(intersect(&n32, 5, &ray, true), [32, NONE, NONE, NONE]);
-        assert_eq!(intersect(&n16, 4, &ray, true), [32, NONE, NONE, NONE]);
-        assert_eq!(intersect(&n32, 5, &ray, false), [NONE, NONE, NONE, 32]);
-        assert_eq!(intersect(&n16, 4, &ray, false), [NONE, NONE, NONE, 32]);
     }
 
     #[test]

@@ -189,7 +189,7 @@ fn upload_victory_tables(ctx: *mut BcPackContext) -> bool {
             bc7_ep8[k * 24 + j] = (u16::from_le_bytes([TABLES_BIN[p], TABLES_BIN[p + 1]]) >> 8) as u8;
         }
         let b0 = TABLES_BIN[o + 50];
-        if b0 > 0 && b0 <= 4 {
+        if (1..=4).contains(&b0) {
             for p in 0..16 {
                 let q = o + 54 + p * 2;
                 let v = i16::from_le_bytes([TABLES_BIN[q], TABLES_BIN[q + 1]]);

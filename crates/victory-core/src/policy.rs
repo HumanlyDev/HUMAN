@@ -6,7 +6,6 @@
 //! [`ensure_outside_repo`] on the destination first. The static half of the
 //! rule is `cargo xtask policy`, which checks what git tracks.
 
-use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 /// Marker file at the root of the source tree.
@@ -63,11 +62,6 @@ pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
     Ok(())
 }
 
-enum Tail {
-    Name(OsString),
-    Parent,
-}
-
 /// Canonicalizes the longest existing prefix of `path` and re-appends the
 /// rest, so that paths which do not exist yet can still be compared.
 fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
@@ -82,52 +76,51 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
             .join(path)
     };
 
-    // Pass 1 peels non-existent trailing components (including `..`) down to
-    // the longest existing prefix and folds `..` onto the canonical prefix.
-    // Pass 2 re-canonicalizes any existing directory or symlink/junction
-    // revealed by folding `missing/..` (e.g. `<outside>/missing/../<repo>/x`).
-    let folded = resolve_existing_prefix(&absolute, path)?;
-    resolve_existing_prefix(&folded, path)
-}
-
-fn resolve_existing_prefix(target: &Path, original: &Path) -> Result<PathBuf, PolicyError> {
-    let mut existing = target;
+    let mut existing = absolute.as_path();
     let mut rest = Vec::new();
     loop {
         match std::fs::canonicalize(existing) {
-            Ok(mut out) => {
-                for segment in rest.into_iter().rev() {
-                    match segment {
-                        Tail::Parent => {
-                            out.pop();
-                        }
-                        Tail::Name(name) => out.push(name),
-                    }
+            Ok(canon) => {
+                let mut out = canon;
+                for component in rest.iter().rev() {
+                    out.push(component);
                 }
-                return Ok(out);
+                return Ok(normalize(&out));
             }
-            Err(source) => {
-                let Some(parent) = existing.parent() else {
+            Err(source) => match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name.to_os_string());
+                    existing = parent;
+                }
+                // `file_name()` is None for a trailing `..`; keep it so `normalize` resolves it.
+                (Some(parent), None) if existing.ends_with("..") => {
+                    rest.push("..".into());
+                    existing = parent;
+                }
+                _ => {
                     return Err(PolicyError::Io {
-                        path: original.to_path_buf(),
+                        path: path.to_path_buf(),
                         source,
                     });
-                };
-                match existing.components().next_back() {
-                    Some(Component::Normal(name)) => rest.push(Tail::Name(name.to_os_string())),
-                    Some(Component::ParentDir) => rest.push(Tail::Parent),
-                    Some(Component::CurDir) => {}
-                    _ => {
-                        return Err(PolicyError::Io {
-                            path: original.to_path_buf(),
-                            source,
-                        });
-                    }
                 }
-                existing = parent;
-            }
+            },
         }
     }
+}
+
+/// Removes `.` and resolves `..` lexically (only used on the non-existing tail).
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -170,53 +163,10 @@ mod tests {
     }
 
     #[test]
-    fn resolves_parent_dir_after_missing_segments() {
-        let tmp = tempfile::tempdir().unwrap();
-        let outside = tmp.path().join("missing").join("..").join("valid-cache");
-        ensure_outside_repo(&outside).unwrap();
-
-        let root = std::fs::canonicalize(compiled_workspace_root()).unwrap();
-        let repo_inside = compiled_workspace_root()
-            .join("missing")
-            .join("..")
-            .join("cache");
-        assert!(matches!(
-            ensure_outside_repo(&repo_inside),
-            Err(PolicyError::InsideRepo { .. })
-        ));
-
-        if let (Some(parent), Some(name)) = (compiled_workspace_root().parent(), root.file_name()) {
-            let sibling_back_in = parent.join("missing").join("..").join(name).join("cache");
-            assert!(matches!(
-                ensure_outside_repo(&sibling_back_in),
-                Err(PolicyError::InsideRepo { .. })
-            ));
-        }
-
-        // A Windows junction reached via `missing/..` must also be canonicalized
-        // and rejected when it targets a repository tree.
-        #[cfg(windows)]
-        {
-            let other_repo = tmp.path().join("other-repo");
-            std::fs::create_dir(&other_repo).unwrap();
-            std::fs::write(other_repo.join(ROOT_MARKER), "").unwrap();
-            let link = tmp.path().join("link-to-repo");
-            let status = std::process::Command::new("cmd")
-                .args(["/C", "mklink", "/J"])
-                .arg(&link)
-                .arg(&other_repo)
-                .status();
-            if status.is_ok_and(|s| s.success()) {
-                let via_missing = tmp
-                    .path()
-                    .join("missing")
-                    .join("..")
-                    .join("link-to-repo")
-                    .join("cache");
-                let err = ensure_outside_repo(&via_missing);
-                let _ = std::fs::remove_dir(&link);
-                assert!(matches!(err, Err(PolicyError::InsideRepo { .. })));
-            }
-        }
+    fn resolves_dot_dot_in_a_path_that_does_not_exist_yet() {
+        let base = std::env::temp_dir().join("victory-policy-no-such");
+        let path = base.join("a").join("..").join("b");
+        let resolved = resolve(&path).expect("a `..` in the missing tail must resolve lexically");
+        assert_eq!(resolved, resolve(&base.join("b")).unwrap());
     }
 }

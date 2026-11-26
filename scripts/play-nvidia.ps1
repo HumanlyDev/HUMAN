@@ -1,65 +1,71 @@
-# Launches a user-supplied title executable with HUMAN's tuned NVIDIA / 8 GB+ GPU switches.
+# Launches a user-supplied title executable with HUMAN's CGBJ Pareto residency
+# and tuned NVIDIA / 8 GB+ GPU switches (with optional Ray-Traced GI mode).
 #
 # Usage:
 #   .\scripts\play-nvidia.ps1 [-Exe <victory.exe>] [-Title <title.exe>]
-#                             [-Console series-s|series-x] [-CardMb 512]
-#                             [-DropMips 1] [-Ambient 0.6] [-ComputeLoopLimit 192]
+#                             [-Console series-s|series-x] [-Ambient 0.8]
+#                             [-RayTracing]
 param(
     [string]$Exe = "$PSScriptRoot\..\target\release\victory.exe",
     [string]$Title = '',
     [ValidateSet('series-s', 'series-x')]
     [string]$Console = 'series-s',
-    [int]$CardMb = 512,
-    [int]$DropMips = 1,
-    [string]$Ambient = '0.6',
-    [int]$ComputeLoopLimit = 192
+    [string]$Ambient = '0.8',
+    [switch]$RayTracing,
+    [int]$RtLoopLimit = 96
 )
 
 if (-not (Test-Path $Exe)) {
-    Write-Error "$Exe not found. Build first: cargo build --release -p victory"
+    Write-Error "$Exe not found. Build first: cargo build --release --locked -p victory"
     exit 1
 }
 
 if (-not $Title) {
     $config = Join-Path $PSScriptRoot '..\victory.toml'
-    if (-not (Test-Path $config)) {
-        Write-Error "No -Title specified and victory.toml not found. Copy victory.example.toml to victory.toml."
-        exit 1
+    if (Test-Path $config) {
+        $dir = (Select-String -Path $config -Pattern "^\s*game_dir\s*=\s*['""]([^'""]+)['""]" | Select-Object -First 1).Matches.Groups[1].Value
+        if ($dir -and (Test-Path $dir)) {
+            $Title = Get-ChildItem $dir -Filter '*.exe' | Where-Object Name -notmatch '^(victory)' | Select-Object -First 1 -ExpandProperty FullName
+        }
     }
-    $dir = (Select-String -Path $config -Pattern "^\s*game_dir\s*=\s*'([^']+)'" | Select-Object -First 1).Matches.Groups[1].Value
-    if (-not $dir -or -not (Test-Path $dir)) {
-        Write-Error "Valid game_dir not found in victory.toml."
-        exit 1
+    if (-not $Title -and $env:VICTORY_GAME_DIR -and (Test-Path $env:VICTORY_GAME_DIR)) {
+        $Title = Get-ChildItem $env:VICTORY_GAME_DIR -Filter '*.exe' | Where-Object Name -notmatch '^(victory)' | Select-Object -First 1 -ExpandProperty FullName
     }
-    $Title = Get-ChildItem $dir -Filter '*.exe' | Where-Object Name -notmatch '^(victory)' | Select-Object -First 1 -ExpandProperty FullName
 }
 
 if (-not $Title -or -not (Test-Path $Title)) {
-    Write-Error "Title executable not found. Pass -Title <path-to-title.exe>."
+    Write-Error "Title executable not found. Pass -Title <path-to-title.exe> or configure game_dir in victory.toml."
     exit 1
 }
 
 $env:XCL_ADAPTER = 'nvidia'
-$env:VICTORY_AMBIENT = $Ambient
-$env:VICTORY_BVH_HOLD = '1'
-$env:VICTORY_TEXTURE_DROP_MIPS = "$DropMips"
-$env:VICTORY_LEVELS_ON_DEMAND = '1'
-$env:VICTORY_PLACED_TEX = '1'
-$env:VICTORY_WIDE_TEXTURES = '1'
-$env:VICTORY_WIDE_BACK = '1'
-$env:VICTORY_TEXTURE_NO_WAIT = '1'
-$env:VICTORY_TEXTURE_STAGE_MS = '120'
-$env:VICTORY_CARD_BUFFERS_MIN_MB = '1'
-$env:VICTORY_CARD_BUFFERS_MB = "$CardMb"
-$env:VICTORY_CARD_ROOM_FOR_BUFFERS = '1'
-$env:VICTORY_INPLACE = '1'
-$env:VICTORY_COPY_PLAIN = '1'
+$env:VICTORY_THIN = '1'
+$env:VICTORY_JOIN_PARTS = '8'
+$env:VICTORY_UPLOAD_AHEAD = '1'
 $env:VICTORY_RELAY = '2'
-$env:VICTORY_ASYNC_SUBMIT = '1'
-$env:VICTORY_QUEUE2 = '1'
+$env:VICTORY_WIDE_BACK = '1'
+$env:VICTORY_CARD_REHASH_RUNS = '1'
+$env:VICTORY_JOIN_COPIES = '1'
+$env:VICTORY_RELAY_COPY = '1'
+$env:VICTORY_CARD_STEPS = '2'
 $env:VICTORY_INDIRECT_WINDOW = '1'
-$env:VICTORY_REFRESH_ONCE = '1'
-$env:VICTORY_VIEW_KNOWN = '1'
-$env:VICTORY_SHADER_LOOP_LIMIT_CS = "$ComputeLoopLimit"
+$env:VICTORY_INDIRECT_BATCH = '2'
+$env:VICTORY_MAP_THREADS = '1'
+$env:VICTORY_CARD_AWAKE = '1'
+$env:VICTORY_SHOW_AFTER = '1'
+$env:VICTORY_TEXTURE_NO_WAIT = '1'
+$env:VICTORY_CARD_BUFFERS_MIN_KB = '64'
+$env:VICTORY_LEVELS_ON_DEMAND = '1'
+$env:VICTORY_AMBIENT_AIR = '1.5'
+$env:VICTORY_AMBIENT = $Ambient
+
+if ($RayTracing) {
+    $env:VICTORY_RT_GI = '1'
+    $env:VICTORY_BVH_BUILDER = '1'
+    $env:VICTORY_BVH_FENCES = '0'
+    $env:VICTORY_FAST_BVH = '1'
+    $env:VICTORY_RT_LOOP_LIMIT = "$RtLoopLimit"
+}
 
 & $Exe run $Title --execute --console $Console
+exit $LASTEXITCODE

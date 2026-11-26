@@ -35,15 +35,4 @@ pub enum ShaderError {
     /// Valid code the translator cannot handle yet: an opcode name or a construct.
     #[error("GFX10 code at {offset:#x}: {what} is not supported")]
     Unsupported { offset: usize, what: &'static str },
-    /// An unsupported hardware SGPR with an identified input register.
-    #[error(
-        "GFX10 code at {offset:#x}: {} is not supported (s{sgpr})",
-        ShaderError::HARDWARE_SGPR_INPUT
-    )]
-    UnsupportedHardwareSgprInput { offset: usize, sgpr: u8 },
-}
-
-impl ShaderError {
-    /// The shared reason used to group hardware SGPR input refusals.
-    pub const HARDWARE_SGPR_INPUT: &'static str = "a hardware SGPR input";
 }

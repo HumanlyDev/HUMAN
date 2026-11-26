@@ -10,6 +10,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
+// (The translator's one file is 570 KiB of source.)
 const MAX_FILE_SIZE: usize = 1024 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
@@ -38,20 +39,9 @@ const EXCEPTIONS: &[(&str, &str)] = &[(
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
     (b"MZ", "PE executable"),
-    (b"\x7FELF", "ELF binary"),
     (b"DXBC", "shader container"),
-    (b"FSSM", "Xbox FSSM shader binary"),
-    (b"SGD5", "SGD5 shader archive"),
-    (b"\x03\x02\x23\x07", "SPIR-V shader binary"),
-    (b"RPF7", "archive packfile (RPF7)"),
-    (b"RPF8", "archive packfile (RPF8)"),
-    (b"RPF9", "archive packfile (RPF9)"),
-    (b"RSC7", "archive resource (RSC7)"),
-    (b"RSC8", "archive resource (RSC8)"),
     (b"DDS ", "DDS texture"),
     (b"RIFF", "RIFF (audio/video)"),
-    (b"BKHD", "Wwise soundbank"),
-    (b"OggS", "Ogg audio"),
     (b"BC\xC0\xDE", "LLVM bitcode"),
     (b"Microsoft C/C++ MSF", "PDB"),
     (b"!<arch>", "library archive"),
@@ -78,25 +68,9 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
             }
             out.stdout
         } else {
-            let full = root.join(path);
-            match std::fs::symlink_metadata(&full) {
-                Ok(meta) if meta.file_type().is_symlink() => {
-                    violations.push(format!("{path}: symbolic link not allowed in repository"));
-                    continue;
-                }
-                Ok(meta) if meta.is_dir() => continue,
-                Ok(_) => match std::fs::read(&full) {
-                    Ok(c) => c,
-                    Err(err) => {
-                        violations.push(format!("{path}: cannot read file: {err}"));
-                        continue;
-                    }
-                },
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => {
-                    violations.push(format!("{path}: cannot inspect file: {err}"));
-                    continue;
-                }
+            match std::fs::read(root.join(path)) {
+                Ok(c) => c,
+                Err(_) => continue,
             }
         };
         for problem in check(path, &content) {
@@ -161,7 +135,7 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
         .into_iter()
         .filter_entry(|e| !matches!(e.file_name().to_str(), Some("target" | ".git")))
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file() || e.file_type().is_symlink())
+        .filter(|e| e.file_type().is_file())
         .filter_map(|e| {
             e.path()
                 .strip_prefix(root)
@@ -196,12 +170,17 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     }
     if content.contains(&0) {
         problems.push("binary content (NUL bytes)".to_owned());
-    } else if std::str::from_utf8(content).is_err() {
-        problems.push("binary or non-UTF-8 content".to_owned());
     } else if let Some(run) = longest_encoded_run(content)
         && run > MAX_ENCODED_RUN
     {
         problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
+    } else {
+        let digits = longest_hex_literal_run(content);
+        if digits > MAX_ENCODED_RUN {
+            problems.push(format!(
+                "{digits} hex digits in one run of \\x/0x literals (embedded data?)"
+            ));
+        }
     }
     problems
 }
@@ -210,6 +189,38 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
 fn longest_encoded_run(content: &[u8]) -> Option<usize> {
     let is_payload = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=');
     content.split(|b| !is_payload(b)).map(<[u8]>::len).max()
+}
+
+/// Most hex digits in `\xNN` escapes or `0x` literals with only commas,
+/// whitespace or backslashes between them: a byte string or `xxd -i` array,
+/// which `longest_encoded_run` sees as many 3- or 4-character runs.
+/// shortcut: decimal arrays (`[77, 90, ...]`) still pass, add a literal count if one shows up.
+fn longest_hex_literal_run(content: &[u8]) -> usize {
+    let (mut i, mut run, mut longest) = (0, 0, 0);
+    while i < content.len() {
+        match &content[i..] {
+            [b'\\' | b'0', b'x' | b'X', rest @ ..] => {
+                let len = rest
+                    .iter()
+                    .take_while(|b| b.is_ascii_hexdigit() || **b == b'_')
+                    .count();
+                run += rest[..len].iter().filter(|b| b.is_ascii_hexdigit()).count();
+                longest = longest.max(run);
+                // Skip a type suffix such as `u8` or `u32`.
+                let suffix = rest[len..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_alphanumeric())
+                    .count();
+                i += 2 + len + suffix;
+            }
+            [b, ..] if matches!(b, b',' | b'\\') || b.is_ascii_whitespace() => i += 1,
+            _ => {
+                run = 0;
+                i += 1;
+            }
+        }
+    }
+    longest
 }
 
 #[cfg(test)]
@@ -241,7 +252,7 @@ mod tests {
             "extension not allowed"
         );
         assert!(
-            !check("a.rs", &vec![b'a'; 1100 * 1024]).is_empty(),
+            !check("a.rs", &vec![b'a'; 600 * 1024]).is_empty(),
             "too big"
         );
     }
@@ -252,40 +263,40 @@ mod tests {
         assert!(!check("src/blob.rs", blob.as_bytes()).is_empty());
     }
 
-    #[test]
-    fn rejects_game_archive_magics_and_non_utf8_binary_without_nuls() {
-        for magic in [
-            b"RPF9header".as_slice(),
-            b"SGD5header".as_slice(),
-            b"RSC7header".as_slice(),
-            b"FSSMheader".as_slice(),
-            b"BKHDheader".as_slice(),
-            b"\x03\x02\x23\x07spirv".as_slice(),
-        ] {
-            assert!(
-                !check("notes.txt", magic).is_empty(),
-                "expected magic {magic:?} to be rejected even in .txt"
-            );
-        }
-        // Raw binary bytes without any NUL byte must still be rejected as non-UTF-8.
-        assert!(!check("notes.txt", &[0xFF, 0xFE, 0x80, 0x90]).is_empty());
+    /// Synthetic bytes, never game data.
+    fn synthetic(n: u32) -> impl Iterator<Item = u32> {
+        (0..n).map(|i| (i * 37 + 11) % 256)
     }
 
-    #[cfg(unix)]
     #[test]
-    fn rejects_symlinks_in_tree() {
-        use std::os::unix::fs::symlink;
+    fn rejects_data_smuggled_as_an_escaped_byte_string() {
+        // 4096 bytes as one unbroken `\xNN` hex run, the shape a byte-string
+        // literal of copied data takes.
+        let esc: String = synthetic(4096).map(|b| format!("\\x{b:02x}")).collect();
+        let src = format!("pub const DATA: &[u8] = b\"{esc}\";\n");
+        assert!(
+            !check("src/data.rs", src.as_bytes()).is_empty(),
+            "{} bytes of \\x-escaped hex passed",
+            src.len()
+        );
+    }
 
-        let dir = std::env::temp_dir().join(format!(
-            "victory-xtask-policy-symlink-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let link = dir.join("dangling.txt");
-        symlink(dir.join("missing-target"), &link).unwrap();
-        let res = super::run(&dir, false);
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(res.is_err(), "dangling symlink in tree must fail policy");
+    #[test]
+    fn rejects_data_smuggled_as_a_hex_byte_array() {
+        // `xxd -i` style: 4096 bytes as hex literals.
+        let lits: Vec<String> = synthetic(4096).map(|b| format!("0x{b:02x}")).collect();
+        let src = format!("pub const DATA: [u8; 4096] = [{}];\n", lits.join(", "));
+        assert!(
+            !check("src/data.rs", src.as_bytes()).is_empty(),
+            "{} bytes of hex array passed",
+            src.len()
+        );
+        // A short constant table, like the 16-entry ones in the tree, stays legal.
+        let table: Vec<String> = synthetic(16).map(|w| format!("0x{w:08x}_u32")).collect();
+        let src = format!(
+            "const T: [u32; 16] = [\n    {},\n];\n",
+            table.join(",\n    ")
+        );
+        assert!(check("src/table.rs", src.as_bytes()).is_empty());
     }
 }

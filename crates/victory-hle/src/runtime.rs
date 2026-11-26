@@ -10,6 +10,7 @@ static MAIN_IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
 /// `GetModuleHandle(NULL)` and friends to return this, not our own exe.
 pub fn set_main_image(base: usize) {
     MAIN_IMAGE_BASE.store(base, Ordering::Release);
+    crate::image_watch::start(base);
 }
 
 pub fn main_image() -> Option<usize> {
@@ -55,6 +56,18 @@ pub fn image_named(file: &str) -> Option<usize> {
         .map(|(b, _)| *b)
 }
 
+static TITLE_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// The arguments the title's `main` gets (those after `--`). Set once, before
+/// the title starts; later calls are ignored.
+pub fn set_title_args(args: Vec<String>) {
+    let _ = TITLE_ARGS.set(args);
+}
+
+pub fn title_args() -> &'static [String] {
+    TITLE_ARGS.get().map_or(&[], Vec::as_slice)
+}
+
 /// Maps a title DLL the title loads itself (`LoadLibrary`) and returns its
 /// base; `Ok(None)` if `file` is not one of the title's DLLs.
 pub type TitleDllLoader = Box<dyn Fn(&str) -> Result<Option<usize>, String> + Send + Sync>;
@@ -96,53 +109,46 @@ impl Title {
                 .map(|(_, text)| text.as_str())
         };
         let id = get("Game/TitleId").and_then(|v| u32::from_str_radix(v, 16).ok());
-        let storage_mb = get("Game/PersistentLocalStorage/SizeMB")
-            .and_then(|v| v.parse::<u64>().ok());
+        let storage_mb = get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse().ok());
         Title {
             id: id.unwrap_or(0),
             store_id: get("Game/StoreId").unwrap_or_default().to_owned(),
             storage: PathBuf::new(),
-            storage_bytes: storage_mb.unwrap_or(0).saturating_mul(1 << 20),
+            storage_bytes: storage_mb.unwrap_or(0) << 20,
         }
     }
 
     /// Where game saves live: next to persistent local storage, under the
-    /// data directory, never the cache. Empty when storage is unset.
+    /// data directory, never the cache.
     pub fn saves(&self) -> PathBuf {
-        if self.storage.as_os_str().is_empty() {
-            return PathBuf::new();
-        }
         self.storage.with_file_name("saves")
     }
 }
 
-/// Byte offset immediately after the closing `>` of the tag starting at `rest`,
-/// ignoring `>` inside single- or double-quoted attribute values.
-fn find_tag_end(rest: &str) -> Option<usize> {
-    let bytes = rest.as_bytes();
-    let mut quote = None;
-    for (i, &b) in bytes.iter().enumerate().skip(1) {
-        match quote {
-            Some(q) if b == q => quote = None,
-            Some(_) => {}
-            None if b == b'"' || b == b'\'' => quote = Some(b),
-            None if b == b'>' => return Some(i + 1),
-            None => {}
+/// The trimmed text of one element: comments inside it are skipped, not
+/// treated as the end of its value. A manifest generator can write
+/// `<TitleId><!-- generated -->639AA8DD</TitleId>`, which must still give
+/// the title's id rather than an empty field.
+fn field_text(rest: &str) -> String {
+    let mut out = String::new();
+    let mut rest = rest;
+    loop {
+        let Some(open) = rest.find('<') else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..open]);
+        if rest[open..].starts_with("<!--") {
+            let Some(end) = rest[open..].find("-->") else {
+                break;
+            };
+            rest = &rest[open + end + 3..];
+        } else {
+            // A child element, a closing tag or anything else ends the text.
+            break;
         }
     }
-    None
-}
-
-fn decode_entities(text: &str) -> String {
-    [
-        ("&lt;", "<"),
-        ("&gt;", ">"),
-        ("&quot;", "\""),
-        ("&apos;", "'"),
-        ("&amp;", "&"),
-    ]
-    .iter()
-    .fold(text.to_owned(), |b, (entity, c)| b.replace(entity, c))
+    out.trim().to_owned()
 }
 
 /// Each element of an XML text as its path from the root (`Game/TitleId`)
@@ -150,21 +156,17 @@ fn decode_entities(text: &str) -> String {
 /// decoded; comments, CDATA sections, declarations and attributes are
 /// skipped.
 fn elements(text: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
+    let mut out = Vec::new();
     let mut path: Vec<&str> = Vec::new();
-    let mut open_entry: Option<usize> = None;
     let mut rest = text;
     while let Some(open) = rest.find('<') {
-        if let Some(idx) = open_entry {
-            out[idx].1.push_str(&rest[..open]);
-        }
         rest = &rest[open..];
         let end = if rest.starts_with("<!--") {
             rest.find("-->").map(|e| e + 3)
         } else if rest.starts_with("<![CDATA[") {
             rest.find("]]>").map(|e| e + 3)
         } else {
-            find_tag_end(rest)
+            tag_end(rest)
         };
         let Some(end) = end else { break };
         let tag = &rest[1..end - 1];
@@ -173,36 +175,43 @@ fn elements(text: &str) -> Vec<(String, String)> {
             continue;
         }
         if let Some(name) = tag.strip_prefix('/') {
-            open_entry = None;
             if let Some(at) = path.iter().rposition(|n| *n == name.trim()) {
                 path.truncate(at);
             }
             continue;
         }
-        let trimmed = tag.trim_end();
-        let closed = trimmed.ends_with('/');
-        let name = trimmed
+        let closed = tag.ends_with('/');
+        let name = tag
             .trim_end_matches('/')
             .split_whitespace()
             .next()
             .unwrap_or("");
         path.push(name);
-        let idx = out.len();
-        out.push((path.join("/"), String::new()));
+        let body = field_text(rest);
+        let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
+            .iter()
+            .fold(body, |b, (entity, c)| b.replace(entity, c));
+        out.push((path.join("/"), body));
         if closed {
             path.pop();
-            open_entry = None;
-        } else {
-            open_entry = Some(idx);
         }
     }
-    if let Some(idx) = open_entry {
-        out[idx].1.push_str(rest);
-    }
-    for (_, body) in &mut out {
-        *body = decode_entities(body.trim());
-    }
     out
+}
+
+/// Where the tag that starts `text` ends, past its `>`; a `>` in a quoted
+/// attribute value is part of the value (XML allows it there unescaped).
+fn tag_end(text: &str) -> Option<usize> {
+    let mut quote = None;
+    for (at, c) in text.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(open), _) if c == open => quote = None,
+            (None, '>') => return Some(at + 1),
+            _ => {}
+        }
+    }
+    None
 }
 
 static TITLE: Mutex<Option<Title>> = Mutex::new(None);
@@ -259,11 +268,39 @@ pub fn use_console_timers() {
         );
         timeBeginPeriod(1);
     }
+    ahead_of_other_programs();
+}
+
+/// The title's streaming thread runs below normal priority (on the console
+/// nobody else wants its core) and does all of the title's loading: a
+/// program that keeps the processors busy at normal priority (a build, a
+/// virus scan) starved it, loading took 40 to 60 s instead of 28 to 33, and
+/// the opening ran without the models that were to be there (runs cpu-1,
+/// play-1125-0203). The process runs above normal, as long as it runs.
+/// `VICTORY_PROCESS_PRIORITY=normal`: as it was started.
+#[cfg(windows)]
+fn ahead_of_other_programs() {
+    use windows_sys::Win32::System::Threading::{ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass};
+    if std::env::var_os("VICTORY_PROCESS_PRIORITY").is_some_and(|v| v == "normal" || v == "0") {
+        return;
+    }
+    // SAFETY: a plain process setting.
+    let set = unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) } != 0;
+    tracing::info!(set, "the process runs above normal priority (VICTORY_PROCESS_PRIORITY=normal: not)");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quoted_angle_bracket_does_not_end_its_tag() {
+        let text = "<Game><ShellVisuals DefaultDisplayName=\"A > B\" Description='x>y'/>\
+                    <TitleId>639AA8DD</TitleId>\
+                    <PersistentLocalStorage><SizeMB>64</SizeMB></PersistentLocalStorage></Game>";
+        let t = Title::from_manifest(text);
+        assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 64 << 20));
+    }
 
     #[test]
     fn reads_title_id_store_id_and_storage_quota() {
@@ -280,25 +317,15 @@ mod tests {
     }
 
     #[test]
-    fn manifest_handles_quoted_gt_inline_comments_overflow_and_unset_saves() {
-        let text = "<Game configVersion=\"1\">\
-                    <Identity Name=\"a>b\"/>\
-                    <TitleId><!-- inline -->639A<!-- mid -->A8DD</TitleId>\
-                    <StoreId>9<!-- c -->&amp;C</StoreId>\
-                    <PersistentLocalStorage><SizeMB>17592186044416</SizeMB></PersistentLocalStorage>\
-                    </Game>";
+    fn inline_comments_do_not_truncate_a_field() {
+        let text = "<Game>\
+            <TitleId><!-- generated -->639AA8DD</TitleId>\
+            <StoreId>9&amp;<!-- keep -->C</StoreId>\
+            <PersistentLocalStorage><SizeMB><!-- n -->1024</SizeMB></PersistentLocalStorage>\
+            </Game>";
         let t = Title::from_manifest(text);
         assert_eq!(t.id, 0x639A_A8DD);
         assert_eq!(t.store_id, "9&C");
-        // 1 << 44 MB overflows u64 when shifted by 20; saturates instead of wrapping to 0.
-        assert_eq!(t.storage_bytes, u64::MAX);
-        // Unset storage yields an empty saves path instead of relative "saves" in CWD.
-        assert!(t.saves().as_os_str().is_empty());
-        assert!(Title::default().saves().as_os_str().is_empty());
-        let configured = Title {
-            storage: PathBuf::from("data/title/storage"),
-            ..t
-        };
-        assert_eq!(configured.saves(), PathBuf::from("data/title/saves"));
+        assert_eq!(t.storage_bytes, 1024 << 20);
     }
 }

@@ -7,7 +7,7 @@
 
 use std::ffi::{c_char, c_void};
 
-use super::xasync::{self, AsyncBlock, E_ILLEGAL_METHOD_CALL};
+use super::xasync::{self, AsyncBlock, E_ILLEGAL_METHOD_CALL, E_INVALIDARG};
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
 };
@@ -301,7 +301,8 @@ extern "system" fn install_async(
 }
 
 /// The game's own store id maps to its installation; nothing else is
-/// installed.
+/// installed, and any other id gets the documented E_INVALIDARG (not
+/// XPackage's "could not resolve" error).
 extern "system" fn package_identifier(
     _: This,
     store_id: *const c_char,
@@ -313,7 +314,7 @@ extern "system" fn package_identifier(
         Some(id) if !title.store_id.is_empty() && id == title.store_id => {
             put_string(&xpackage::identifier(), size, buffer, std::ptr::null_mut())
         }
-        _ => xpackage::NO_PACKAGE,
+        _ => E_INVALIDARG,
     }
 }
 
@@ -367,9 +368,9 @@ static VTABLE: Methods<77> = Methods([
     missing::<31> as *const (),              // 0xf8
     missing::<32> as *const (),              // 0x100
     consumable_balance_async as *const (),   // 0x108
-    status as *const (),                     // 0x110
+    count_status as *const (),               // 0x110
     report_fulfillment_async as *const (),   // 0x118
-    status as *const (),                     // 0x120
+    count_status as *const (),               // 0x120
     user_id_async as *const (),              // 0x128 collections id
     size_status as *const (),                // 0x130
     string_status as *const (),              // 0x138
@@ -427,6 +428,133 @@ mod tests {
     }
 
     #[test]
+    fn offline_async_calls_report_network_error_from_their_result_slots() {
+        assert!(VTABLE.0.len() > 0x260 / 8);
+
+        let this: This = &OBJECT;
+        type StoreIdAsync =
+            extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
+        type ReportFulfillmentAsync = extern "system" fn(
+            This,
+            Handle,
+            *const c_char,
+            u32,
+            *const c_void,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        type PurchaseUiAsync = extern "system" fn(
+            This,
+            Handle,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        type RedeemUiAsync = extern "system" fn(
+            This,
+            Handle,
+            *const c_char,
+            *const *const c_char,
+            usize,
+            bool,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        type StatusResult = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
+        type CountResult = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
+
+        let mut b = block();
+        assert_eq!(
+            method::<StoreIdAsync>(&OBJECT, 0x258)(
+                this,
+                handle(&CONTEXT),
+                c"9DUMMY".as_ptr(),
+                &mut b,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+        assert_eq!(
+            method::<StatusResult>(&OBJECT, 0x260)(this, &mut b),
+            NETWORK_ERROR
+        );
+
+        let mut b = block();
+        let mut remaining = 7u32;
+        assert_eq!(
+            method::<ReportFulfillmentAsync>(&OBJECT, 0x118)(
+                this,
+                handle(&CONTEXT),
+                c"9DUMMY".as_ptr(),
+                1,
+                std::ptr::null(),
+                &mut b,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+        assert_eq!(
+            method::<CountResult>(&OBJECT, 0x120)(this, &mut b, &mut remaining),
+            NETWORK_ERROR
+        );
+        assert_eq!(remaining, 7);
+
+        let mut b = block();
+        assert_eq!(
+            method::<PurchaseUiAsync>(&OBJECT, 0x188)(
+                this,
+                handle(&CONTEXT),
+                c"9DUMMY".as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut b,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+        assert_eq!(
+            method::<StatusResult>(&OBJECT, 0x190)(this, &mut b),
+            NETWORK_ERROR
+        );
+
+        let mut b = block();
+        assert_eq!(
+            method::<RedeemUiAsync>(&OBJECT, 0x1a8)(
+                this,
+                handle(&CONTEXT),
+                c"DUMMY-TOKEN".as_ptr(),
+                std::ptr::null(),
+                0,
+                false,
+                &mut b,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+        assert_eq!(
+            method::<StatusResult>(&OBJECT, 0x1b0)(this, &mut b),
+            NETWORK_ERROR
+        );
+
+        let mut b = block();
+        let mut balance = 3u32;
+        assert_eq!(
+            method::<StoreIdAsync>(&OBJECT, 0x108)(
+                this,
+                handle(&CONTEXT),
+                c"9DUMMY".as_ptr(),
+                &mut b,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+        assert_eq!(
+            method::<CountResult>(&OBJECT, 0x110)(this, &mut b, &mut balance),
+            NETWORK_ERROR
+        );
+        assert_eq!(balance, 3);
+    }
+
+    #[test]
     fn the_game_is_licensed_and_the_store_is_offline() {
         let this: This = &OBJECT;
         assert_eq!(size_of::<GameLicense>(), 104);
@@ -479,88 +607,13 @@ mod tests {
     }
 
     #[test]
-    fn offline_async_slots_have_matching_in_bounds_result_slots() {
-        let this: This = &OBJECT;
-        type StatusFn = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
-
-        // 0x258 / 0x260: XStoreShowProductPageUIAsync + Result (previously read OOB past VTABLE).
-        type ProductPage = extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
-        let mut b = block();
+    fn a_store_id_without_a_package_is_an_invalid_argument() {
+        type Query = extern "system" fn(This, *const c_char, usize, *mut u8) -> HRESULT;
+        let query = method::<Query>(&OBJECT, 0x208);
+        let mut id = [0u8; 33];
         assert_eq!(
-            method::<ProductPage>(&OBJECT, 0x258)(this, handle(&CONTEXT), c"9XYZ".as_ptr(), &mut b),
-            S_OK
+            query(&OBJECT, c"9NOTINSTALLED".as_ptr(), 33, id.as_mut_ptr()),
+            E_INVALIDARG
         );
-        assert_eq!(method::<StatusFn>(&OBJECT, 0x260)(this, &mut b), NETWORK_ERROR);
-
-        // 0x118 / 0x120: XStoreReportConsumableFulfillmentAsync + Result.
-        type Fulfill = extern "system" fn(
-            This,
-            Handle,
-            *const c_char,
-            u32,
-            *const c_void,
-            *mut AsyncBlock,
-        ) -> HRESULT;
-        let mut b = block();
-        assert_eq!(
-            method::<Fulfill>(&OBJECT, 0x118)(
-                this,
-                handle(&CONTEXT),
-                c"9XYZ".as_ptr(),
-                1,
-                std::ptr::null(),
-                &mut b,
-            ),
-            S_OK
-        );
-        assert_eq!(method::<StatusFn>(&OBJECT, 0x120)(this, &mut b), NETWORK_ERROR);
-
-        // 0x188 / 0x190: XStoreShowPurchaseUIAsync + Result.
-        type Purchase = extern "system" fn(
-            This,
-            Handle,
-            *const c_char,
-            *const c_char,
-            *const c_char,
-            *mut AsyncBlock,
-        ) -> HRESULT;
-        let mut b = block();
-        assert_eq!(
-            method::<Purchase>(&OBJECT, 0x188)(
-                this,
-                handle(&CONTEXT),
-                c"9XYZ".as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                &mut b,
-            ),
-            S_OK
-        );
-        assert_eq!(method::<StatusFn>(&OBJECT, 0x190)(this, &mut b), NETWORK_ERROR);
-
-        // 0x1a8 / 0x1b0: XStoreShowRedeemTokenUIAsync + Result.
-        type Redeem = extern "system" fn(
-            This,
-            Handle,
-            *const c_char,
-            *const *const c_char,
-            usize,
-            bool,
-            *mut AsyncBlock,
-        ) -> HRESULT;
-        let mut b = block();
-        assert_eq!(
-            method::<Redeem>(&OBJECT, 0x1a8)(
-                this,
-                handle(&CONTEXT),
-                c"TOKEN".as_ptr(),
-                std::ptr::null(),
-                0,
-                false,
-                &mut b,
-            ),
-            S_OK
-        );
-        assert_eq!(method::<StatusFn>(&OBJECT, 0x1b0)(this, &mut b), NETWORK_ERROR);
     }
 }
