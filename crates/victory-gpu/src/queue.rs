@@ -986,12 +986,15 @@ extern "system" fn present(
                 (resource as usize, copy, state)
             })
         };
-        let texture = base_res.and_then(take_copy);
-        let overlay = (planes > 1 && !plane_parameters.is_null())
+        let mut texture = base_res.and_then(take_copy);
+        let mut overlay = (planes > 1 && !plane_parameters.is_null())
             .then(|| overlay_resource(plane_parameters))
             .flatten()
             .filter(|&over_res| base_res != Some(over_res))
             .and_then(take_copy);
+        if texture.is_none() {
+            texture = overlay.take();
+        }
         let resource = texture.as_ref().map_or(0, |t| t.0);
         behind::present(
             this,
@@ -1006,38 +1009,52 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let overlay = (planes > 1)
+        // SAFETY: the title passes `planes` plane descriptions.
+        let base_res = unsafe { plane_parameters.as_ref() }
+            .filter(|plane| plane.count > 0 && !plane.resources.is_null())
+            // SAFETY: the plane lists `count` resources.
+            .map(|plane| unsafe { *plane.resources });
+        let over_res = (planes > 1)
             .then(|| overlay_resource(plane_parameters))
             .flatten()
-            .filter(|&over_res| over_res != resource)
-            .and_then(|over_res| {
-                crate::resource::host_resource(over_res).map(|over_tex| {
-                    let over_state = crate::resource::host_transition(over_res, COPY_SOURCE)
-                        .map_or(COPY_SOURCE, |(_, before)| before);
-                    (over_res, over_tex, over_state)
-                })
+            .filter(|&over_res| base_res != Some(over_res));
+        let base = base_res.and_then(|res| crate::resource::host_resource(res).map(|tex| (res, tex)));
+        let over = over_res.and_then(|res| crate::resource::host_resource(res).map(|tex| (res, tex)));
+        let (primary, secondary) = match (base, over) {
+            (Some(b), o) => (Some(b), o),
+            (None, Some(o)) => (Some(o), None),
+            (None, None) => (None, None),
+        };
+        if let Some((resource, texture)) = primary {
+            let state = crate::resource::host_transition(resource, COPY_SOURCE)
+                .map_or(COPY_SOURCE, |(_, before)| before);
+            let overlay = secondary.map(|(over_res, over_tex)| {
+                let same = windows::core::Interface::as_raw(over_tex)
+                    == windows::core::Interface::as_raw(texture);
+                let over_state = if same {
+                    state
+                } else {
+                    crate::resource::host_transition(over_res, COPY_SOURCE)
+                        .map_or(COPY_SOURCE, |(_, before)| before)
+                };
+                (over_res, over_tex, over_state, !same)
             });
-        show_planes(
-            texture,
-            state,
-            overlay.as_ref().map(|(_, tex, st)| (*tex, *st)),
-            Shown { frame, resource: resource as usize },
-        );
-        crate::resource::host_transition(resource, state);
-        if let Some((over_res, _, over_state)) = overlay {
-            crate::resource::host_transition(over_res, over_state);
+            show_planes(
+                texture,
+                state,
+                overlay.as_ref().map(|(_, tex, st, _)| (*tex, *st)),
+                Shown { frame, resource: resource as usize },
+            );
+            crate::resource::host_transition(resource, state);
+            if let Some((over_res, _, over_state, own_state)) = overlay
+                && own_state
+            {
+                crate::resource::host_transition(over_res, over_state);
+            }
         }
         let _ = host;
     }
@@ -1208,11 +1225,13 @@ extern "system" fn copy_page_mappings(
     S_OK
 }
 
-extern "system" fn desc(this: This, out: *mut QueueDesc) {
+/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+extern "system" fn desc(this: This, out: *mut QueueDesc) -> *mut QueueDesc {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
         unsafe { out.write(queue(this).desc) };
     }
+    out
 }
 
 /// The queue methods by their slot in older titles' queues (the 2020-era
@@ -1277,6 +1296,164 @@ mod tests {
         } else {
             0x70
         }
+    }
+
+    fn desc_slot(q: This) -> usize {
+        // SAFETY: one of our queues; its first field is the table.
+        let table = unsafe { *q.cast::<*const *const ()>() };
+        if table == NEWER_FUNCTIONS.0.as_ptr() {
+            0xe0
+        } else {
+            0xd0
+        }
+    }
+
+    #[test]
+    fn queue_get_desc_returns_its_output_pointer() {
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 2,
+            priority: 100,
+            flags: 1,
+            nodes: 1,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let mut out = std::mem::MaybeUninit::<QueueDesc>::uninit();
+        type GetDesc = extern "system" fn(This, *mut QueueDesc) -> *mut QueueDesc;
+        let get_desc = slot::<GetDesc>(q, desc_slot(q));
+        assert_eq!(get_desc(q, out.as_mut_ptr()), out.as_mut_ptr());
+        // SAFETY: written above.
+        let read = unsafe { out.assume_init() };
+        assert_eq!(
+            (read.kind, read.priority, read.flags, read.nodes),
+            (desc.kind, desc.priority, desc.flags, desc.nodes)
+        );
+        assert!(get_desc(q, std::ptr::null_mut()).is_null());
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    /// Distinct title resources can name the same host texture. Presenting
+    /// both planes must preserve that texture's original rendering state.
+    #[cfg(windows)]
+    #[test]
+    fn aliased_present_planes_preserve_the_host_texture_state() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_RENDER_TARGET;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const TARGET: u32 = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        // SAFETY: one 64 KiB page of committed read-write memory for the test resources.
+        let address = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                64 << 10,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!address.is_null());
+        let null = std::ptr::null();
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        #[repr(align(8))]
+        struct TextureWords([u32; 14]);
+        let desc = TextureWords([3, 0, 0, 0, 32, 0, 32, 1 | 1 << 16, 87, 1, 0, 1, 1, 0]);
+        let resources = std::array::from_fn::<_, 2, _>(|_| {
+            let mut resource = null;
+            assert_eq!(
+                crate::resource::create_at_address(
+                    null,
+                    address as u64,
+                    desc.0.as_ptr().cast(),
+                    0,
+                    null.cast(),
+                    &iid,
+                    &mut resource,
+                ),
+                S_OK
+            );
+            resource
+        });
+        assert_ne!(resources[0], resources[1]);
+        let primary = crate::resource::host_copy(resources[0]).unwrap();
+        let alias = crate::resource::host_copy(resources[1]).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&primary, &alias));
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, resources[0], TARGET);
+        // SAFETY: the texture is a live render target, on an open list.
+        unsafe {
+            list.list.ClearRenderTargetView(
+                host.rtv(Some(&primary.texture), None),
+                &[0.25, 0.5, 0.75, 1.0],
+                None,
+            );
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(primary.state.load(Ordering::Relaxed), TARGET);
+
+        let planes = resources.each_ref().map(|resource| RetailPlane {
+            prefix: Plane {
+                token: 0,
+                count: 1,
+                resources: std::ptr::from_ref(resource),
+            },
+            source_rects: std::ptr::null(),
+            destination: std::ptr::null(),
+            color_space: 0,
+            options: [0; 7],
+        });
+        assert_eq!(present(null, 2, planes.as_ptr().cast(), null.cast()), S_OK);
+        let restored = primary.state.load(Ordering::Relaxed);
+
+        let empty_first = [
+            RetailPlane {
+                prefix: Plane {
+                    token: 0,
+                    count: 0,
+                    resources: std::ptr::null(),
+                },
+                source_rects: std::ptr::null(),
+                destination: std::ptr::null(),
+                color_space: 0,
+                options: [0; 7],
+            },
+            RetailPlane {
+                prefix: Plane {
+                    token: 0,
+                    count: 1,
+                    resources: std::ptr::from_ref(&resources[1]),
+                },
+                source_rects: std::ptr::null(),
+                destination: std::ptr::null(),
+                color_space: 0,
+                options: [0; 7],
+            },
+        ];
+        assert_eq!(present(null, 2, empty_first.as_ptr().cast(), null.cast()), S_OK);
+        let restored_after_empty = primary.state.load(Ordering::Relaxed);
+
+        let release = |resource| slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
+        for resource in resources {
+            assert_eq!(release(resource), 0);
+        }
+        drop((list, primary, alias));
+        crate::title_memory_freed(address as usize, 64 << 10);
+        // SAFETY: freeing our own allocation after releasing the resources.
+        assert_ne!(unsafe { VirtualFree(address, 0, MEM_RELEASE) }, 0);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(restored, TARGET, "the two planes share one rendering state");
+        assert_eq!(restored_after_empty, TARGET, "overlay plane promotes cleanly when plane 0 is empty");
     }
 
     #[test]
