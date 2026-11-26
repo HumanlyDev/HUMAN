@@ -1499,6 +1499,38 @@ fn fills(desc: &ResourceDesc) -> bool {
     desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED == 0
 }
 
+/// How many of its largest levels the host copy of a 2D texture described by
+/// `desc` leaves out (`VICTORY_TEXTURE_DROP_MIPS=N`, 0..=4). When unset,
+/// defaults to `1` on `<= 10 GiB` VRAM GPUs or `<= 32 GiB` host RAM systems so
+/// 2D textures `>= 512px` take a quarter of their VRAM and staging bytes.
+#[cfg(windows)]
+pub(crate) fn drop_levels(desc: &ResourceDesc) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let n = *N.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_DROP_MIPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or_else(|| {
+                let low_vram = crate::host::host()
+                    .and_then(|h| h.video_memory())
+                    .is_some_and(|[budget, ..]| budget <= 10 << 30);
+                u32::from(low_vram || crate::residency::limited_host_ram())
+            })
+            .min(4)
+    });
+    if n == 0 || !fills(desc) || desc.dimension != TEXTURE_2D || desc.depth_or_array_size != 1 || desc.sample_count > 1 {
+        return 0;
+    }
+    let n = n.min(u32::from(desc.mip_levels).saturating_sub(1));
+    let (w, h) = (desc.width, u64::from(desc.height));
+    let whole = |side: u64| side % (4 << n) == 0;
+    if n == 0 || w.min(h) < 512 || !whole(w) || !whole(h) {
+        return 0;
+    }
+    n
+}
+
 /// Whether the title fills texture `this` itself ([`fills`]).
 #[cfg(windows)]
 pub(crate) fn title_fills(this: This) -> bool {
@@ -1579,12 +1611,18 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // The levels views show ([`held_only`]), those of the slots shaders
         // pick by index among them.
         let mut base = 0;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
-            let wanted = r.host.wanted.load(Relaxed);
-            let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
-            let first = wanted.min(viewed);
-            if first != u32::MAX {
-                base = base_level(&r.desc, first);
+        if shape_fits && r.host.placed.load(Relaxed) && tiled.is_none() && alias_of(this).is_none() {
+            let drop = drop_levels(&r.desc);
+            if held_only() {
+                let wanted = r.host.wanted.load(Relaxed);
+                let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
+                let first = wanted.min(viewed);
+                let first = if first == u32::MAX { drop } else { first.max(drop) };
+                if first > 0 {
+                    base = base_level(&r.desc, first);
+                }
+            } else if drop > 0 {
+                base = base_level(&r.desc, drop);
             }
         }
         let texture = match texture {
@@ -1731,7 +1769,22 @@ pub(crate) fn targets_room_kept() -> u64 {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map_or_else(
+                || {
+                    let low_vram = crate::host::host()
+                        .and_then(|h| h.video_memory())
+                        .is_some_and(|[budget, ..]| budget <= 10 << 30);
+                    let mb = if crate::console::current() == crate::console::Console::SeriesS {
+                        1024
+                    } else if low_vram {
+                        1280
+                    } else {
+                        3072
+                    };
+                    mb << 20
+                },
+                |mb| mb.min(8192) << 20,
+            )
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));

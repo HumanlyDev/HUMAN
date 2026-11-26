@@ -376,7 +376,12 @@ pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     };
-    ram_idle_for(effective, keep_freed() && !crate::residency::limited_host_ram())
+    let ms = ram_idle_for(effective, keep_freed() && !crate::residency::limited_host_ram());
+    if crate::residency::limited_host_ram() {
+        ms.min(5_000)
+    } else {
+        ms
+    }
 }
 
 fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
@@ -1932,8 +1937,11 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                let limit = if keep_freed() && !crate::residency::limited_host_ram() {
+                let limited = crate::residency::limited_host_ram();
+                let limit = if keep_freed() && !limited {
                     SPARE_KEPT
+                } else if limited {
+                    32 << 20
                 } else {
                     SPARE_MOST
                 };

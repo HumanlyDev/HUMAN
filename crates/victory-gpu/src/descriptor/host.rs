@@ -3615,6 +3615,19 @@ fn view_extent() -> bool {
 /// buffer object. The slot then showed a copy nothing brought up to date,
 /// and what shaders wrote through it was looked for in the other copy.
 pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    if let &View::Constant(address, size) = view {
+        let len = u64::from(size);
+        if len == 0 {
+            return None;
+        }
+        let shadow = crate::shadow::find(address, len)?;
+        if shadow.gpu(address) % 256 != 0
+            && let Some(exact) = crate::shadow::exact(address, len)
+        {
+            return Some((exact, address, len));
+        }
+        return Some((shadow, address, len));
+    }
     let (address, len) = buffer_range(view)?;
     if len == 0 {
         return None;
@@ -4159,14 +4172,19 @@ fn make_twinned(
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
-            let gpu = shadow.gpu(address);
+            let mut shadow = crate::shadow::find(address, u64::from(size))?;
+            let mut gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
-                once!(
-                    address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
-                );
-                return None;
+                if let Some(exact) = crate::shadow::exact(address, u64::from(size)) {
+                    gpu = exact.gpu(address);
+                    shadow = exact;
+                } else {
+                    once!(
+                        address = format_args!("{address:#x}"),
+                        "constant buffer not 256-byte aligned on the host"
+                    );
+                    return None;
+                }
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,

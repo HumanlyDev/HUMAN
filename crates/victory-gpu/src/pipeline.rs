@@ -761,6 +761,7 @@ static FUNCTIONS: Table<24> = {
     f[0] = query as *const ();
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
+    f[11] = object::ignore as *const (); // 0x58
     Table(f)
 };
 
