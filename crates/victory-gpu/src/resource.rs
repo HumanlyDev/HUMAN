@@ -1107,11 +1107,13 @@ extern "system" fn heap_query(this: This, iid: *const Iid, out: *mut This) -> HR
 extern "system" fn heap_release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
-extern "system" fn heap_desc(this: This, out: *mut HeapDesc) {
+/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+extern "system" fn heap_desc(this: This, out: *mut HeapDesc) -> *mut HeapDesc {
     if !out.is_null() {
         // SAFETY: `this` is a heap; the title passes room for a description.
         unsafe { out.write((*this.cast::<Heap>()).desc) };
     }
+    out
 }
 
 /// A resource's memory: its own, or a range of a heap it holds a reference
@@ -3157,11 +3159,13 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
     S_OK
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
-extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
+/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) -> *mut ResourceDesc {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
         unsafe { out.write(resource(this).desc) };
     }
+    out
 }
 /// Device method `GetCustomHeapProperties`, returning its struct through a
 /// hidden first argument: what a standard heap type is as a custom heap.
@@ -4489,6 +4493,14 @@ float4 lit() : SV_Target { return 1.0; }
             &mut committed,
         );
         assert_eq!(hr, S_OK);
+        let mut back = std::mem::MaybeUninit::<ResourceDesc>::uninit();
+        type GetResourceDesc = extern "system" fn(This, *mut ResourceDesc) -> *mut ResourceDesc;
+        let get_desc = slot::<GetResourceDesc>(committed, 0x50);
+        assert_eq!(get_desc(committed, back.as_mut_ptr()), back.as_mut_ptr());
+        // SAFETY: written above.
+        let read = unsafe { back.assume_init() };
+        assert_eq!((read.dimension, read.width), (BUFFER, 256));
+        assert!(get_desc(committed, std::ptr::null_mut()).is_null());
         let mut data = std::ptr::null_mut();
         assert_eq!(
             slot::<Map>(committed, 0x40)(committed, 0, null.cast(), &mut data),
@@ -4500,6 +4512,13 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(slot::<Release>(committed, 0x10)(committed), 0);
 
         let heap = heap(4 * KIB_64);
+        let mut heap_back = std::mem::MaybeUninit::<HeapDesc>::uninit();
+        type GetHeapDesc = extern "system" fn(This, *mut HeapDesc) -> *mut HeapDesc;
+        let get_heap_desc = slot::<GetHeapDesc>(heap, 0x40);
+        assert_eq!(get_heap_desc(heap, heap_back.as_mut_ptr()), heap_back.as_mut_ptr());
+        // SAFETY: written above.
+        assert_eq!(unsafe { heap_back.assume_init() }.size, 4 * KIB_64);
+        assert!(get_heap_desc(heap, std::ptr::null_mut()).is_null());
         let place = |offset, desc: &ResourceDesc, out: &mut This| {
             create_placed(
                 null,
