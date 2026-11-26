@@ -264,7 +264,6 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
     if dst.is_empty() || !dst.len().is_multiple_of(block) {
         return Err(Error("destination is not a whole number of blocks"));
     }
-    let blocks = dst.len() / block;
     let (widths, per): (&[u8], usize) = match bc {
         1 => (&[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1),
         3 => (&[3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7], 2),
@@ -273,20 +272,14 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         6 => (&[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2),
         _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
     };
-    let stride = widths.len() * per;
-    let mut records = vec![0u8; blocks * stride];
-    let mut next = src.iter().copied();
-    lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
-    let records = records.chunks_exact(stride);
-    let out = dst.chunks_exact_mut(block);
     let t = tables;
     match bc {
-        1 => plain(records, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
-        3 => plain(records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
-        4 => plain(records, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
-        5 => plain(records, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
-        6 => bc6(records, out, &t.bc6),
-        _ => bc7(records, out, t),
+        1 => plain(t, widths, per, src, dst, block, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
+        3 => plain(t, widths, per, src, dst, block, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
+        4 => plain(t, widths, per, src, dst, block, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
+        5 => plain(t, widths, per, src, dst, block, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
+        6 => bc6(t, widths, per, src, dst, &t.bc6),
+        _ => bc7(t, widths, per, src, dst),
     }
 }
 
@@ -399,20 +392,20 @@ fn bucket_of(t: &Tables, model: u8, slot: u32) -> usize {
     b
 }
 
-/// Decodes `per` symbols per block on every lane into `records` (one record
-/// of `widths.len() * per` symbols per block), taking input from `fetch`
-/// (given the lane that takes the byte) in the order of the schedule: each
-/// round the lanes step in order and take at most 8 bytes between them.
+/// Decodes `per` symbols per block on every lane and streams each completed
+/// record (`widths.len() * per` symbols) to `on_record`, taking input from
+/// `fetch` (given the lane that takes the byte) in the order of the schedule:
+/// each round the lanes step in order and take at most 8 bytes between them.
 // shortcut: one lane step at a time (BC1 roughly 30-60 MB/s, BC7 15-20 MB/s
 // on one core); if texture streaming needs more, run the schedule only to
 // split the input per lane and decode the lanes apart.
-fn lanes(
+fn lanes_stream(
     t: &Tables,
     widths: &[u8],
     per: usize,
     blocks: usize,
     mut fetch: impl FnMut(usize) -> Option<u8>,
-    records: &mut [u8],
+    mut on_record: impl FnMut(usize, &[u8]) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let mut lanes = [Lane::default(); 16];
     let lanes = &mut lanes[..widths.len()];
@@ -421,10 +414,10 @@ fn lanes(
         lane.need = true;
     }
     let stride = widths.len() * per;
+    debug_assert!(stride <= 32);
+    let mut record = [0u8; 32];
     let full = (1u32 << widths.len()) - 1;
-    let (mut pos, mut done, mut idle) = (0, 0u32, 0);
-    // Where symbol `pos` of lane 0 goes; lane j's is `per * j` further on.
-    let mut at = 0;
+    let (mut pos, mut sub, mut done, mut idle) = (0, 0, 0u32, 0);
     while pos < blocks * per {
         let (mut taken, mut moved) = (0, false);
         for (j, lane) in lanes.iter_mut().enumerate() {
@@ -445,18 +438,18 @@ fn lanes(
             if !lane.stalled
                 && let Some(sym) = lane.out.take()
             {
-                records[at + j * per] = sym;
+                record[sub + j * per] = sym;
                 done |= bit;
                 moved = true;
             }
         }
         if done == full {
             pos += 1;
-            at += if pos.is_multiple_of(per) {
-                stride - per + 1
-            } else {
-                1
-            };
+            sub += 1;
+            if sub == per {
+                on_record(pos / per - 1, &record[..stride])?;
+                sub = 0;
+            }
             done = 0;
             moved = true;
         }
@@ -467,6 +460,22 @@ fn lanes(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn lanes(
+    t: &Tables,
+    widths: &[u8],
+    per: usize,
+    blocks: usize,
+    fetch: impl FnMut(usize) -> Option<u8>,
+    records: &mut [u8],
+) -> Result<(), Error> {
+    let stride = widths.len() * per;
+    lanes_stream(t, widths, per, blocks, fetch, |i, s| {
+        records[i * stride..(i + 1) * stride].copy_from_slice(s);
+        Ok(())
+    })
 }
 
 // Blocks.
@@ -526,9 +535,14 @@ const BC3: Widths = widths([5, 6, 5, 5, 6, 5, 8, 8], 16, 16, true);
 const BC4: Widths = widths([8, 8, 0, 0, 0, 0, 0, 0], 16, 0, false);
 const BC5: Widths = widths([8, 8, 8, 8, 0, 0, 0, 0], 32, 0, true);
 
-fn plain<'a>(
-    records: impl Iterator<Item = &'a [u8]>,
-    out: impl Iterator<Item = &'a mut [u8]>,
+#[allow(clippy::too_many_arguments)]
+fn plain(
+    t: &Tables,
+    widths: &[u8],
+    per: usize,
+    src: &[u8],
+    dst: &mut [u8],
+    block_size: usize,
     dictionary: &[Plain],
     w: &Widths,
     residual: impl Fn(&[u8]) -> Plain,
@@ -536,7 +550,10 @@ fn plain<'a>(
 ) -> Result<(), Error> {
     let mut history = vec![Plain::default(); HISTORY];
     let zero = Plain::default();
-    for (i, (s, block)) in records.zip(out).enumerate() {
+    let mut next = src.iter().copied();
+    let blocks = dst.len() / block_size;
+    lanes_stream(t, widths, per, blocks, |_| next.next(), |i, s| {
+        let block = &mut dst[i * block_size..(i + 1) * block_size];
         let (ep_ref, ix_ref) = references(s, w.paired);
         let ep_ref = &pick(i, ep_ref, &history, dictionary, &zero).ep;
         let ix_ref = &pick(i, ix_ref, &history, dictionary, &zero).ix;
@@ -549,8 +566,8 @@ fn plain<'a>(
         }
         history[i % HISTORY] = v;
         pack(&v, block);
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// 2-bit index residuals: one symbol per 2x2 quad.
@@ -757,14 +774,19 @@ fn bc7_precision(ctrl: u16) -> [u8; 4] {
     p
 }
 
-fn bc7<'a>(
-    records: impl Iterator<Item = &'a [u8]>,
-    out: impl Iterator<Item = &'a mut [u8]>,
+fn bc7(
     t: &Tables,
+    widths: &[u8],
+    per: usize,
+    src: &[u8],
+    dst: &mut [u8],
 ) -> Result<(), Error> {
     let mut history = vec![(Bc7Ep::default(), Bc7Ix::default()); HISTORY];
     let zero = (Bc7Ep::default(), Bc7Ix::default());
-    for (i, (s, block)) in records.zip(out).enumerate() {
+    let mut next = src.iter().copied();
+    let blocks = dst.len() / 16;
+    lanes_stream(t, widths, per, blocks, |_| next.next(), |i, s| {
+        let block = &mut dst[i * 16..(i + 1) * 16];
         let (ep_ref, ix_ref) = references(s, true);
         let ctrl = t.ctrl7[usize::from(s[31] & 15) << 5 | usize::from(s[30] & 31)];
         if ctrl == 0 {
@@ -843,8 +865,8 @@ fn bc7<'a>(
         }
         history[i % HISTORY] = (ep, ix);
         bc7_pack(&ep, &ix, prec, block);
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
@@ -1057,9 +1079,12 @@ fn bc6_index_bits(mode: u8) -> u8 {
     }
 }
 
-fn bc6<'a>(
-    records: impl Iterator<Item = &'a [u8]>,
-    out: impl Iterator<Item = &'a mut [u8]>,
+fn bc6(
+    t: &Tables,
+    widths: &[u8],
+    per: usize,
+    src: &[u8],
+    dst: &mut [u8],
     dictionary: &[(Bc6Ep, Bc6Ix)],
 ) -> Result<(), Error> {
     let mut history = vec![(Bc6Ep::default(), Bc6Ix::default()); HISTORY];
@@ -1076,7 +1101,10 @@ fn bc6<'a>(
             acc | u16::from(a >> k & 1) << (2 * k) | u16::from(b >> k & 1) << (2 * k + 1)
         })
     };
-    for (i, (s, block)) in records.zip(out).enumerate() {
+    let mut next = src.iter().copied();
+    let blocks = dst.len() / 16;
+    lanes_stream(t, widths, per, blocks, |_| next.next(), |i, s| {
+        let block = &mut dst[i * 16..(i + 1) * 16];
         let (ep_ref, ix_ref) = references(s, true);
         let mode = s[30].wrapping_add(1);
         if !(1..=14).contains(&mode) {
@@ -1157,8 +1185,8 @@ fn bc6<'a>(
             w.put(v.into(), u32::from(bits) - u32::from(short));
         }
         block.copy_from_slice(&w.v.to_le_bytes());
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]

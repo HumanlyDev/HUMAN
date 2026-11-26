@@ -26,10 +26,17 @@ const MAX_BATCH_STREAM_BYTES: u32 = 24 * 1024 * 1024;
 
 struct Job {
     bc: u8,
-    src: Vec<u8>,
+    src_ptr: *const u8,
+    src_len: usize,
+    out_ptr: *mut u8,
     out_len: usize,
-    reply: mpsc::SyncSender<Result<Vec<u8>, &'static str>>,
+    reply: mpsc::SyncSender<Result<(), &'static str>>,
 }
+
+// SAFETY: `submit_gpu_worker` blocks synchronously on `reply_rx.recv()` until
+// the worker finishes touching `src_ptr` and `out_ptr` and sends the reply, so
+// the caller's slices remain live and exclusively borrowed for the job's lifetime.
+unsafe impl Send for Job {}
 
 struct FfiDecoder(*mut BcPackContext);
 
@@ -49,8 +56,8 @@ impl FfiDecoder {
         Some(dec)
     }
 
-    fn decode(&mut self, bc: u8, src: &[u8], out_len: usize) -> Result<Vec<u8>, &'static str> {
-        let (fmt, blk_bytes) = match bc {
+    fn decode(&mut self, job: &Job) -> Result<(), &'static str> {
+        let (fmt, blk_bytes) = match job.bc {
             1 => (BCPACK_FORMAT_BC1, 8usize),
             3 => (BCPACK_FORMAT_BC3, 16usize),
             4 => (BCPACK_FORMAT_BC4, 8usize),
@@ -59,30 +66,30 @@ impl FfiDecoder {
             7 => (BCPACK_FORMAT_BC7, 16usize),
             _ => return Err("unsupported BC format"),
         };
-        if !out_len.is_multiple_of(blk_bytes) || out_len == 0 {
+        if !job.out_len.is_multiple_of(blk_bytes) || job.out_len == 0 || job.src_len == 0 {
             return Err("invalid output size");
         }
-        let num_blocks = (out_len / blk_bytes) as u32;
-        let mut out = vec![0u8; out_len];
+        let num_blocks = (job.out_len / blk_bytes) as u32;
         let mut fence = 0u64;
-        // SAFETY: `self.0` is valid for `&mut self`; `src` and `out` point to live slices of their lengths.
+        // SAFETY: `self.0` is valid for `&mut self`; `job.src_ptr` and `job.out_ptr`
+        // point to the caller's live slices while the caller blocks on `job.reply`.
         let rc = unsafe {
             BcPackDecodeAsync(
                 self.0,
-                src.as_ptr(),
-                src.len() as u32,
+                job.src_ptr,
+                job.src_len as u32,
                 num_blocks,
                 fmt,
                 BCPACK_SWIZZLE_LINEAR,
                 0,
                 0,
-                out.as_mut_ptr(),
-                out_len as u32,
+                job.out_ptr,
+                job.out_len as u32,
                 &mut fence,
             )
         };
         if rc == 0 {
-            Ok(out)
+            Ok(())
         } else {
             Err("GPU BCPack decode error")
         }
@@ -100,7 +107,7 @@ fn worker_loop(rx: Receiver<Job>) {
     let mut dec = FfiDecoder::new();
     while let Ok(job) = rx.recv() {
         let res = match dec.as_mut() {
-            Some(d) => d.decode(job.bc, &job.src, job.out_len),
+            Some(d) => d.decode(&job),
             None => Err("no DX12 compute adapter"),
         };
         let _ = job.reply.send(res);
@@ -251,7 +258,9 @@ fn submit_gpu_worker(
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
     let job = Job {
         bc,
-        src: src.to_vec(),
+        src_ptr: src.as_ptr(),
+        src_len: src.len(),
+        out_ptr: out.as_mut_ptr(),
         out_len: out.len(),
         reply: reply_tx,
     };
@@ -259,10 +268,7 @@ fn submit_gpu_worker(
         return None;
     }
     match reply_rx.recv() {
-        Ok(Ok(bytes)) => {
-            out.copy_from_slice(&bytes);
-            Some(Ok(()))
-        }
+        Ok(Ok(())) => Some(Ok(())),
         Ok(Err(e)) => {
             tracing::debug!("gpu-bcpack fallback to CPU: {e}");
             None

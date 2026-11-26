@@ -530,7 +530,7 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
-    let original = emit_program(c, native, p, st, io, res);
+    let mut original = emit_program(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -545,6 +545,15 @@ pub fn emit(
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
+        // On a 32-lane host, an `Ok((_, Some(64)))` original will always be
+        // rejected by `supported()` below; drop its DXIL blob now before
+        // building retry forms.
+        if matches!(&original, Ok((_, Some(64)))) {
+            original = Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "no wave32 lowering for this wave64 program",
+            });
+        }
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
@@ -611,17 +620,26 @@ pub fn emit(
             };
             Some((p, st, io, res))
         };
-        let forms = [
-            ("without early-outs", form("without early-outs", ir::without_early_outs(p))),
-            ("without skips", form("without skips", ir::without_skips(p, false))),
+        // Build and try each form lazily so we do not hold two full IR/BDD/IO/
+        // resource pipelines in memory when the first form already succeeds.
+        let mut forms = [
+            ("without early-outs", None),
+            ("without skips", None),
         ];
-        for (name, f) in &forms {
-            if let Some((p, st, io, res)) = f {
-                let again = emit_program(c, native, p, st, io, res);
-                report(name, &again);
-                if done(&again) {
-                    return again.map(|(shader, _)| shader);
-                }
+        forms[0].1 = form("without early-outs", ir::without_early_outs(p));
+        if let Some((p, st, io, res)) = &forms[0].1 {
+            let again = emit_program(c, native, p, st, io, res);
+            report("without early-outs", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+        }
+        forms[1].1 = form("without skips", ir::without_skips(p, false));
+        if let Some((p, st, io, res)) = &forms[1].1 {
+            let again = emit_program(c, native, p, st, io, res);
+            report("without skips", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
             }
         }
         // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host

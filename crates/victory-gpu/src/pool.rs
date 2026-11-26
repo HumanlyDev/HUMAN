@@ -35,8 +35,9 @@ const SPARE_KEPT: usize = 64;
 /// The same of blocks of staging buffers, which are the PC's memory: run
 /// crash-1 held 5.2 GB of them.
 const STAGING_KEPT: usize = 8;
-/// How many are kept now.
+/// How many are kept now (texture pool and staging pool separately).
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
+static STAGING_SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
@@ -45,6 +46,14 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     let pressure = crate::residency::pressured();
     let limit = spares(memory, crate::host::keep_freed() && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
+    let staging_limit = if crate::residency::critical_commit() {
+        0
+    } else if pressure {
+        1
+    } else {
+        limit
+    };
+    STAGING_SPARES.store(staging_limit, Ordering::Relaxed);
     let tick = now();
     // A full pool can become idle while another subsystem needs the VRAM.
     // A busy allocator observes the new limit on its next allocation or tick.
@@ -52,13 +61,6 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         pool.reclaim(tick, limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
-        let staging_limit = if crate::residency::critical_commit() {
-            0
-        } else if pressure {
-            1
-        } else {
-            limit
-        };
         pool.reclaim(tick, staging_limit, true);
     }
 }
@@ -303,9 +305,14 @@ impl<B: Clone> Pool<B> {
     }
 
     /// Makes the pieces that rested long enough free, and lets go of empty
-    /// blocks past [`SPARE`].
+    /// blocks past the pool's current spare limit.
     fn rested(&mut self, now: u64) {
-        self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
+        let limit = if self.most == STAGING_KEPT {
+            STAGING_SPARES.load(Ordering::Relaxed)
+        } else {
+            SPARES.load(Ordering::Relaxed)
+        };
+        self.reclaim(now, limit, false);
     }
 
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
@@ -318,6 +325,10 @@ impl<B: Clone> Pool<B> {
                 block.free.give(piece.start, piece.len);
                 any |= block.free.whole(BLOCK);
             }
+        }
+        if self.resting.capacity() > 1024 && self.resting.len() * 4 < self.resting.capacity() {
+            let keep = self.resting.len().max(256);
+            self.resting.shrink_to(keep);
         }
         // (Without a piece given back too, once there is less room.)
         let most = limit.min(self.most);
@@ -474,6 +485,10 @@ fn made_now(texture: &ID3D12Resource) {
     let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
     while recent.front().is_some_and(|r| r.1 + 1000 < now) {
         recent.pop_front();
+    }
+    if recent.capacity() > 1024 && recent.len() * 4 < recent.capacity() {
+        let keep = recent.len().max(256);
+        recent.shrink_to(keep);
     }
     recent.push_back((texture.as_raw() as usize, now));
 }
@@ -637,6 +652,23 @@ mod tests {
         pool.give(held, REST);
         pool.reclaim(2 * REST, 0, true);
         assert_eq!(pool.blocks(), 0);
+    }
+
+    #[test]
+    fn resting_queue_shrinks_after_burst_drain() {
+        let mut pool = Pool::new(STAGING_KEPT);
+        pool.add(1u32, 0);
+        for i in 0..2048u64 {
+            pool.give(Piece { block: 0, start: i * 512, len: 512 }, 0);
+        }
+        assert!(pool.resting.capacity() >= 2048);
+        pool.reclaim(REST, 0, true);
+        assert!(pool.resting.is_empty());
+        assert!(
+            pool.resting.capacity() <= 512,
+            "resting capacity stayed bloated: {}",
+            pool.resting.capacity()
+        );
     }
 
     #[test]

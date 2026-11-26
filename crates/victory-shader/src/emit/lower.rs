@@ -2435,13 +2435,28 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
-        let user_data = self.user_reads.values().copied().collect();
-        self.s.samplers = self.samplers.len() as u32;
-        let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
-        let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
-        let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
-        let cmp_samplers = self.s.cmp_samplers;
-        let wave_size = self.s.wave_size;
+        // Release all lowering maps and tables before `Shader::finish()` runs
+        // optimization, bitcode serialization, and container assembly.
+        let (mut s, samplers, user_data) = {
+            let Self {
+                s,
+                samplers,
+                user_reads,
+                ..
+            } = self;
+            let user_data = user_reads.values().copied().collect();
+            (s, samplers, user_data)
+        };
+        s.samplers = samplers.len() as u32;
+        let root_cbvs = s.root_cbvs.iter().map(|r| r.0).collect();
+        let root_srvs = s.root_srvs.iter().map(|r| r.0).collect();
+        let root_uavs = s.root_uavs.iter().map(|r| r.0).collect();
+        let cmp_samplers = s.cmp_samplers;
+        let wave_size = s.wave_size;
+        #[cfg(test)]
+        let nonuniform_handles = s.nonuniform_handles;
+        #[cfg(test)]
+        let wave_ops = s.flags & flags::WAVE_OPS != 0;
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -2449,12 +2464,12 @@ impl<'a> Lower<'a> {
             root_srvs,
             root_uavs,
             #[cfg(test)]
-            nonuniform_handles: self.s.nonuniform_handles,
+            nonuniform_handles,
             #[cfg(test)]
-            wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            dxil: self.s.finish(),
+            wave_ops,
+            dxil: s.finish(),
             user_data,
-            samplers: self.samplers,
+            samplers,
         })
     }
 

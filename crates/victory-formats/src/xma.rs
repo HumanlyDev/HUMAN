@@ -126,12 +126,29 @@ impl Cursor<'_> {
 /// Reads the frame starting at bit `start` (a frame start inside a packet's
 /// payload) of `data`, a buffer of whole packets of one stream.
 pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
+    let mut out = Vec::new();
+    let (bits, next) = read_frame_into(data, start, &mut out)?;
+    Some(Frame {
+        data: out,
+        bits,
+        start,
+        next,
+    })
+}
+
+/// Like [`read_frame`], but reuses `out` instead of allocating a new `Vec<u8>`
+/// on every XMA frame. Returns `(bits, next_frame_bit)`.
+pub fn read_frame_into(data: &[u8], start: usize, out: &mut Vec<u8>) -> Option<(usize, Option<usize>)> {
     let mut cursor = Cursor { data, pos: start };
     let bits = cursor.bits(LENGTH_BITS)? as usize;
     if bits <= LENGTH_BITS as usize || bits == 0x7fff {
         return None;
     }
-    let mut out = Vec::with_capacity(bits.div_ceil(8));
+    out.clear();
+    let bytes = bits.div_ceil(8);
+    if out.capacity() < bytes {
+        out.reserve(bytes - out.capacity());
+    }
     let mut cursor = Cursor { data, pos: start };
     for _ in 0..bits / 8 {
         out.push(cursor.byte()?);
@@ -142,12 +159,7 @@ pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
     }
     let end = cursor.pos;
     let next = next_frame(data, start, end);
-    Some(Frame {
-        data: out,
-        bits,
-        start,
-        next,
-    })
+    Some((bits, next))
 }
 
 /// Where the frame after the one at `start`..`end` begins: right after it,

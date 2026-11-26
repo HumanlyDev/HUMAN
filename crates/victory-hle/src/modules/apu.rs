@@ -135,6 +135,8 @@ struct State {
     /// Results not yet dequeued, per stream.
     queued: Vec<u32>,
     results: VecDeque<ApuResult>,
+    /// Reusable PCM decode scratch buffer (avoids a 46 KiB allocation per packet).
+    pcm_scratch: Vec<f32>,
     commands: u32,
     dequeued: u32,
 }
@@ -208,6 +210,7 @@ pub extern "system" fn XApuConnect(
             streams: (0..streams).map(|_| None).collect(),
             queued: vec![0; streams],
             results: VecDeque::new(),
+            pcm_scratch: Vec::new(),
             commands: 0,
             dequeued: 0,
         }),
@@ -269,7 +272,8 @@ pub extern "system" fn XApuEnqueueCommand(
         input_length: 0,
         input: std::ptr::null(),
     };
-    let decoder = &mut state.streams[stream];
+    let state_ref = &mut *state;
+    let decoder = &mut state_ref.streams[stream];
     match id.kind {
         ACTIVATE => {
             // SAFETY: an activate command is this struct.
@@ -300,7 +304,13 @@ pub extern "system" fn XApuEnqueueCommand(
             // SAFETY: a process command is this struct.
             let command = unsafe { command.cast::<Process>().read_unaligned() };
             match decoder {
-                Some(d) => process(d, connection.options, &command, &mut result),
+                Some(d) => process(
+                    d,
+                    connection.options,
+                    &command,
+                    &mut result,
+                    &mut state_ref.pcm_scratch,
+                ),
                 None => result.error = INVALID_STREAM,
             }
         }
@@ -322,7 +332,13 @@ pub extern "system" fn XApuEnqueueCommand(
 
 /// Decodes one packet into the command's output buffer, keeping the frames
 /// from `first_frame` on, at most `frame_count` of them.
-fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &mut ApuResult) {
+fn process(
+    decoder: &mut OpusDecoder,
+    options: u32,
+    command: &Process,
+    result: &mut ApuResult,
+    pcm: &mut Vec<f32>,
+) {
     let channels = decoder.channels();
     let (input, input_length) = (command.input, command.input_length);
     let (output, output_length) = (command.output, command.output_length);
@@ -335,8 +351,11 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     }
     // SAFETY: the title's packet in its connection memory.
     let packet = unsafe { std::slice::from_raw_parts(input, input_length as usize) };
-    let mut pcm = vec![0f32; MAX_FRAMES * channels];
-    let decoded = match decoder.decode(packet, MAX_FRAMES, &mut pcm) {
+    let needed = MAX_FRAMES * channels;
+    if pcm.len() < needed {
+        pcm.resize(needed, 0.0);
+    }
+    let decoded = match decoder.decode(packet, MAX_FRAMES, &mut pcm[..needed]) {
         Ok(n) => n,
         Err(_) => {
             result.error = BAD_PACKET;

@@ -294,6 +294,26 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     }
 }
 
+/// Drops excess idle [`HostList`]s under host memory pressure so their
+/// command allocators and scratch buffers are reclaimed.
+#[cfg(windows)]
+pub(crate) fn trim_idle() {
+    let keep = if crate::residency::critical_commit() { 0 } else { 32 };
+    let dropped: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.0.len() <= keep {
+            return;
+        }
+        let excess: Vec<Idle> = idle.0.drain(keep..).collect();
+        idle.1 = idle.0.iter().map(|i| i.1).sum();
+        if idle.0.capacity() > 128 && idle.0.len() <= 32 {
+            idle.0.shrink_to(64);
+        }
+        excess
+    };
+    drop(dropped);
+}
+
 /// A wait for a memory value recorded into list `this`, with waits cut
 /// into lists (`crate::queue::cuts`). On the console the queue runs the
 /// list up to the wait, stands there until the value is in memory, and
@@ -674,7 +694,13 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     // Every submission of the list has run (submissions are waited for).
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    {
+        let mut uploads = uploads.lock().unwrap_or_else(|e| e.into_inner());
+        uploads.clear();
+        if uploads.capacity() > 256 {
+            uploads.shrink_to(32);
+        }
+    }
     // The parts of a recording that was cut and never submitted go with it
     // (a submission takes the parts it runs).
     #[cfg(windows)]
@@ -683,7 +709,13 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         // into it nor submits it during its reset.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
+        if list.earlier.capacity() > 256 {
+            list.earlier.shrink_to(32);
+        }
         list.gate.clear();
+        if list.gate.capacity() > 256 {
+            list.gate.shrink_to(32);
+        }
     }
     #[cfg(windows)]
     with_state(this, |host, state| {

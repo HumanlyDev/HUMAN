@@ -262,25 +262,108 @@ impl Recording {
     }
 }
 
+/// Maximum closed back lists kept idle in [`BACKS`].
+const BACKS_MAX: usize = 64;
+
+/// Releases uploads, cut parts, and dynamic descriptor slots held by an unused
+/// back list before parking it in [`BACKS`].
+fn clean_back(back: usize) {
+    // SAFETY: `back` is an exclusively owned `Box<List>` produced by `back_list`.
+    let list = unsafe { &mut *(back as *mut List) };
+    {
+        let mut uploads = list.uploads.lock().unwrap_or_else(|e| e.into_inner());
+        uploads.clear();
+        if uploads.capacity() > 256 {
+            uploads.shrink_to(32);
+        }
+    }
+    list.earlier.clear();
+    if list.earlier.capacity() > 256 {
+        list.earlier.shrink_to(32);
+    }
+    list.gate.clear();
+    if list.gate.capacity() > 256 {
+        list.gate.shrink_to(32);
+    }
+    list.state.lock().unwrap_or_else(|e| e.into_inner()).tables_done();
+}
+
+/// Drops a boxed back list outside [`BACKS`].
+fn free_back(back: usize) {
+    // SAFETY: `back` was created by `Box::into_raw(super::boxed(...))` in `back_list`.
+    unsafe { drop(Box::from_raw(back as *mut List)) };
+}
+
+/// Drops excess idle thin-recording stream buffers and back lists under host
+/// memory pressure.
+pub(crate) fn trim_idle() {
+    let critical = crate::residency::critical_commit();
+    let keep_words = if critical { 0 } else { 64 };
+    let dropped_words: Vec<Vec<u64>> = {
+        let mut words = held(&WORDS);
+        if words.len() > keep_words {
+            let excess: Vec<Vec<u64>> = words.drain(keep_words..).collect();
+            if words.capacity() > 128 {
+                words.shrink_to(64);
+            }
+            excess
+        } else {
+            Vec::new()
+        }
+    };
+    drop(dropped_words);
+
+    let keep_backs = if critical { 0 } else { 8 };
+    let dropped_backs: Vec<usize> = {
+        let mut backs = held(&BACKS);
+        if backs.len() > keep_backs {
+            let excess: Vec<usize> = backs.drain(keep_backs..).collect();
+            if backs.capacity() > 64 {
+                backs.shrink_to(16);
+            }
+            excess
+        } else {
+            Vec::new()
+        }
+    };
+    for back in dropped_backs {
+        free_back(back);
+    }
+}
+
 impl Drop for Recording {
     fn drop(&mut self) {
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
-        give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)).collect());
+        give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)));
         if inner.back != 0 {
             if !inner.closed {
                 // Left in the middle.
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            clean_back(inner.back);
+            let limit = if crate::residency::pressured() { 16 } else { BACKS_MAX };
+            let overflow = {
+                let mut backs = held(&BACKS);
+                if backs.len() < limit {
+                    backs.push(inner.back);
+                    None
+                } else {
+                    Some(inner.back)
+                }
+            };
+            if let Some(back) = overflow {
+                free_back(back);
+            }
         }
     }
 }
 
-fn give_back(streams: Vec<Vec<u64>>) {
+fn give_back(streams: impl IntoIterator<Item = Vec<u64>>) {
+    let limit = if crate::residency::pressured() { 64 } else { 1024 };
     let mut words = held(&WORDS);
     for mut s in streams {
-        if words.len() < 1024 && s.capacity() <= 16 * CHUNK {
+        if words.len() < limit && s.capacity() <= 16 * CHUNK {
             s.clear();
             words.push(s);
         }

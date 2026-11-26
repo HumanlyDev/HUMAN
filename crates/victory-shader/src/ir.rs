@@ -735,8 +735,14 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
         p.blocks[b].exit == Exit::End
             && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
     };
+    let has_early_out = p.blocks.iter().any(|block| {
+        matches!(block.exit, Exit::Branch { taken, .. } if ends(taken))
+            && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz")
+    });
+    if !has_early_out {
+        return None;
+    }
     let mut blocks = p.blocks.clone();
-    let mut any = false;
     for block in &mut blocks {
         let Exit::Branch { taken, not_taken } = block.exit else {
             continue;
@@ -744,11 +750,7 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
         if ends(taken) && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
             block.insts.pop();
             block.exit = Exit::Jump(not_taken);
-            any = true;
         }
-    }
-    if !any {
-        return None;
     }
     for block in &mut blocks {
         block.phis.clear();

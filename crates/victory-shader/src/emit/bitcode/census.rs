@@ -78,11 +78,19 @@ pub fn take(dxil: &[u8]) -> Option<Census> {
 /// Counts `m`, whose written form is `bitcode`, and keeps the result for
 /// [`take`].
 pub(crate) fn note(m: &Module, bitcode: &[u8]) {
+    const MAX_WRITTEN: usize = 32;
     if !enabled() {
         return;
     }
     let c = m.census();
-    WRITTEN.with(|l| l.borrow_mut().push((bitcode.len(), fnv(bitcode), c)));
+    WRITTEN.with(|l| {
+        let mut written = l.borrow_mut();
+        if written.len() >= MAX_WRITTEN {
+            let drop_n = written.len() + 1 - MAX_WRITTEN;
+            written.drain(..drop_n);
+        }
+        written.push((bitcode.len(), fnv(bitcode), c));
+    });
 }
 
 fn kind(name: &str) -> usize {

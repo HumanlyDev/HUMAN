@@ -149,23 +149,35 @@ impl Port {
 
 /// The thread pool behind thread-pool ports: idle workers are reused, and a
 /// new one starts whenever more tasks wait than workers idle, so a callback
-/// that blocks on another never starves it. Workers stay for reuse.
+/// that blocks on another never starves it. Burst workers above the warm floor
+/// exit after sitting idle so their OS stacks are reclaimed.
 struct Pool {
-    /// Queued tasks and the number of idle workers.
-    state: Mutex<(VecDeque<Task>, usize)>,
+    /// Queued tasks, idle workers, and total live workers.
+    state: Mutex<(VecDeque<Task>, usize, usize)>,
     ready: Condvar,
 }
 
 static POOL: Pool = Pool {
-    state: Mutex::new((VecDeque::new(), 0)),
+    state: Mutex::new((VecDeque::new(), 0, 0)),
     ready: Condvar::new(),
 };
+
+fn warm_workers() -> usize {
+    static FLOOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(2)
+    })
+}
 
 impl Pool {
     fn submit(&'static self, task: Task) {
         let mut state = lock(&self.state);
         state.0.push_back(task);
         if state.0.len() > state.1 {
+            state.2 += 1;
             std::thread::spawn(move || self.work());
         } else {
             self.ready.notify_one();
@@ -173,12 +185,25 @@ impl Pool {
     }
 
     fn work(&self) {
+        const IDLE_EXIT: std::time::Duration = std::time::Duration::from_secs(30);
+        let floor = warm_workers();
         let mut state = lock(&self.state);
         loop {
             while state.0.is_empty() {
+                if state.0.capacity() > 64 {
+                    state.0.shrink_to(32);
+                }
                 state.1 += 1;
-                state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
+                let (next, timeout) = self
+                    .ready
+                    .wait_timeout(state, IDLE_EXIT)
+                    .unwrap_or_else(|e| e.into_inner());
+                state = next;
                 state.1 -= 1;
+                if timeout.timed_out() && state.0.is_empty() && state.2 > floor {
+                    state.2 -= 1;
+                    return;
+                }
             }
             let task = state.0.pop_front();
             drop(state);

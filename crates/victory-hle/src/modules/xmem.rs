@@ -508,7 +508,7 @@ struct Physical {
     views: BTreeMap<usize, (usize, Slice)>,
     /// Placeholders that are some view's own, left by its unmapping: address
     /// and length. The title may have joined one with others since.
-    holes: HashMap<usize, usize>,
+    holes: BTreeMap<usize, usize>,
 }
 
 impl Physical {
@@ -531,13 +531,77 @@ struct Pages {
     pages: HashMap<usize, Slice>,
 }
 
+/// Inline small-storage list of virtual addresses showing a single 64 KiB
+/// physical page. Nearly every page is mapped at 1 or 2 addresses (pool + tiled
+/// heap), so keeping up to 2 addresses inline avoids ~100,000 heap `Vec`s.
+enum MappedAt {
+    One(usize),
+    Two(usize, usize),
+    Many(Vec<usize>),
+}
+
+impl MappedAt {
+    fn push(&mut self, addr: usize) {
+        match self {
+            MappedAt::One(a) => *self = MappedAt::Two(*a, addr),
+            MappedAt::Two(a, b) => *self = MappedAt::Many(vec![*a, *b, addr]),
+            MappedAt::Many(v) => v.push(addr),
+        }
+    }
+
+    /// Removes all occurrences of `addr`, returning `true` if now empty.
+    fn remove_all(&mut self, addr: usize) -> bool {
+        match self {
+            MappedAt::One(a) => *a == addr,
+            MappedAt::Two(a, b) => match (*a == addr, *b == addr) {
+                (true, true) => true,
+                (true, false) => {
+                    *self = MappedAt::One(*b);
+                    false
+                }
+                (false, true) => {
+                    *self = MappedAt::One(*a);
+                    false
+                }
+                (false, false) => false,
+            },
+            MappedAt::Many(v) => {
+                v.retain(|&x| x != addr);
+                match v.as_slice() {
+                    [] => true,
+                    [a] => {
+                        *self = MappedAt::One(*a);
+                        false
+                    }
+                    [a, b] => {
+                        *self = MappedAt::Two(*a, *b);
+                        false
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    fn extend_into(&self, out: &mut Vec<(usize, usize)>) {
+        match self {
+            MappedAt::One(a) => out.push((*a, PAGE)),
+            MappedAt::Two(a, b) => {
+                out.push((*a, PAGE));
+                out.push((*b, PAGE));
+            }
+            MappedAt::Many(v) => out.extend(v.iter().map(|&at| (at, PAGE))),
+        }
+    }
+}
+
 /// Where the title sees its pages: [`Physical::views`] the other way.
 /// Locked apart from them, and only for a moment ([`PAGES`]).
 #[derive(Default)]
 struct Shown {
     /// The addresses that show a page, by the page's section and index.
     /// Views of more than [`SHORT`] pages are in `long`.
-    pages: HashMap<(usize, usize), Vec<usize>>,
+    pages: HashMap<(usize, usize), MappedAt>,
     /// Address, bytes, section, first page.
     long: Vec<(usize, usize, usize, usize)>,
 }
@@ -560,7 +624,15 @@ impl Shown {
             return;
         }
         for k in 0..len / PAGE {
-            self.pages.entry((section, slice.index + k)).or_default().push(base + k * PAGE);
+            let addr = base + k * PAGE;
+            match self.pages.entry((section, slice.index + k)) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(MappedAt::One(addr));
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    e.get_mut().push(addr);
+                }
+            }
         }
     }
 
@@ -572,11 +644,10 @@ impl Shown {
         let section = Arc::as_ptr(&slice.section) as usize;
         for k in 0..len / PAGE {
             let key = (section, slice.index + k);
-            if let Some(at) = self.pages.get_mut(&key) {
-                at.retain(|&at| at != base + k * PAGE);
-                if at.is_empty() {
-                    self.pages.remove(&key);
-                }
+            if let Some(at) = self.pages.get_mut(&key)
+                && at.remove_all(base + k * PAGE)
+            {
+                self.pages.remove(&key);
             }
         }
     }
@@ -584,8 +655,10 @@ impl Shown {
     /// Where the title sees the page at `slice`: addresses and bytes.
     fn at(&self, slice: &Slice) -> Vec<(usize, usize)> {
         let section = Arc::as_ptr(&slice.section) as usize;
-        let mut out: Vec<(usize, usize)> =
-            self.pages.get(&(section, slice.index)).into_iter().flatten().map(|&at| (at, PAGE)).collect();
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        if let Some(mapped) = self.pages.get(&(section, slice.index)) {
+            mapped.extend_into(&mut out);
+        }
         for &(base, len, of, index) in &self.long {
             if of == section && (index..index + len / PAGE).contains(&slice.index) {
                 out.push((base + (slice.index - index) * PAGE, PAGE));
@@ -687,6 +760,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let mut table = page_table_mut();
     let first = table.next_page;
     table.next_page += n * FRAMES;
+    table.pages.reserve(n);
     for index in 0..n {
         let slice = Slice {
             section: section.clone(),
@@ -1876,6 +1950,37 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);
     }
+    if kind & (MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0 && !address.is_null() {
+        let base = address as usize;
+        let span = if size != 0 {
+            size
+        } else {
+            let mut info = std::mem::MaybeUninit::<MEMORY_BASIC_INFORMATION>::zeroed();
+            // SAFETY: querying the current process's own virtual address.
+            let got = unsafe {
+                VirtualQueryEx(
+                    GetCurrentProcess(),
+                    address,
+                    info.as_mut_ptr(),
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if got != 0 {
+                // SAFETY: `VirtualQueryEx` succeeded and initialized `info`.
+                unsafe { info.assume_init() }.RegionSize
+            } else {
+                0
+            }
+        };
+        if span != 0 {
+            let mut physical = physical();
+            let end = base.saturating_add(span);
+            let stale: Vec<usize> = physical.holes.range(base..end).map(|(&k, _)| k).collect();
+            for k in stale {
+                physical.holes.remove(&k);
+            }
+        }
+    }
     // SAFETY: the title's own arguments.
     unsafe { VirtualFree(address, size, kind) }
 }
@@ -2547,5 +2652,23 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn mapped_at_stays_inline_for_one_or_two_and_downgrades_on_remove() {
+        let mut m = MappedAt::One(0x1000);
+        m.push(0x2000);
+        assert!(matches!(m, MappedAt::Two(0x1000, 0x2000)));
+        m.push(0x3000);
+        assert!(matches!(m, MappedAt::Many(_)));
+        let mut out = Vec::new();
+        m.extend_into(&mut out);
+        assert_eq!(out, vec![(0x1000, PAGE), (0x2000, PAGE), (0x3000, PAGE)]);
+
+        assert!(!m.remove_all(0x2000));
+        assert!(matches!(m, MappedAt::Two(0x1000, 0x3000)));
+        assert!(!m.remove_all(0x1000));
+        assert!(matches!(m, MappedAt::One(0x3000)));
+        assert!(m.remove_all(0x3000));
     }
 }
