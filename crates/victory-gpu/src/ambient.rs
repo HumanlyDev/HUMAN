@@ -97,9 +97,34 @@ fn set() -> Set {
     *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
 }
 
-/// Whether the stand-in is on: set, and the title's rays find nothing.
+/// Whether the stand-in is on: set (`VICTORY_AMBIENT` non-zero).
+/// When the RT BVH builder is off, replaces or raises diffuse GI and caps
+/// indoor air scattering; when the RT BVH builder is running, acts as a soft
+/// interior floor and firefly clamp to prevent pitch-black RT voids.
 pub(crate) fn on() -> bool {
-    set() != Set::Off && !crate::pipeline::builder_runs()
+    set() != Set::Off
+}
+
+/// Floor multiplier applied to the directional ambient estimate when the RT
+/// BVH builder is running (`VICTORY_AMBIENT_RT_FLOOR`, default `0.45`; `0`
+/// disables the floor in RT mode).
+fn rt_floor() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_RT_FLOOR").unwrap_or_default();
+        if set.trim().is_empty() {
+            return 0.45;
+        }
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v >= 0.0).unwrap_or(0.45)
+    })
+}
+
+/// Whether to preserve the title's own resolve output up to `most` when the
+/// BVH builder is off (`VICTORY_AMBIENT_KEEP_SKY=1`). Off by default because
+/// stale/disoccluded probe-tile blocks appear on camera movement.
+fn keep_sky() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_KEEP_SKY").is_some_and(|v| v == "1"))
 }
 
 /// The most the air scatters, as a multiple of the light around
@@ -128,7 +153,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -137,7 +162,8 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float rt_floor;
+    uint depth_width; uint depth_height; uint flags; uint unused;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -149,7 +175,9 @@ static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
 float3 seen(int2 p, float2 size) {
-    float d = depth.Load(int3(clamp(p, int2(0, 0), int2(size) - 1), 0));
+    float2 dsize = float2(depth_width, depth_height);
+    int2 dp = clamp(int2((float2(p) + 0.5) / size * dsize), int2(0, 0), int2(depth_width, depth_height) - 1);
+    float d = depth.Load(int3(dp, 0));
     float z = min(near / max(d, 1e-7), 1000.0);
     float2 ndc = (float2(p) + 0.5) / size * 2.0 - 1.0;
     return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
@@ -189,7 +217,8 @@ void mean() {
 void place(uint3 at : SV_DispatchThreadID) {
     float2 size = float2(width, height);
     float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(CX, CY)), size);
-    cells[CELLS + 1 + at.y * CX + at.x] = float4(p, p.z * p.z);
+    float wz = min(p.z, 50.0);
+    cells[CELLS + 1 + at.y * CX + at.x] = float4(p, wz * wz);
 }
 #endif
 
@@ -298,35 +327,55 @@ void raise(uint3 at : SV_DispatchThreadID) {
         light[p] = pack(found);
         return;
     }
-    // Between the four points around, those at its own depth first; which
-    // four is dithered a little.
-    float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
-    int2 g0 = int2(floor(g));
-    float2 f = g - float2(g0);
-    float4 sr = 0, sg = 0, sb = 0;
-    float sum = 0;
-    for (int k = 0; k < 4; k++) {
-        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
-        float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
-        float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
-        float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
-        uint at0 = (q.y * PX + q.x) * 3;
-        sr += w * points[at0];
-        sg += w * points[at0 + 1];
-        sb += w * points[at0 + 2];
-        sum += w;
+    bool rt_mode = (flags & 1u) != 0;
+    bool has_kept = (flags & 2u) != 0;
+    bool keep_sky_flag = (flags & 4u) != 0;
+    if (!has_kept) {
+        found = float3(0.08, 0.08, 0.09) * level * open;
+    } else {
+        // Between the four points around, those at its own depth first; which
+        // four is dithered a little.
+        float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
+        int2 g0 = int2(floor(g));
+        float2 f = g - float2(g0);
+        float4 sr = 0, sg = 0, sb = 0;
+        float sum = 0;
+        for (int k = 0; k < 4; k++) {
+            int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+            float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
+            float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+            float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
+            uint at0 = (q.y * PX + q.x) * 3;
+            sr += w * points[at0];
+            sg += w * points[at0 + 1];
+            sb += w * points[at0 + 2];
+            sum += w;
+        }
+        float3 all = float3(sr.w, sg.w, sb.w) / sum;
+        found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
+        found = clamp(found, 0.2 * all, 2.5 * all);
+        found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+        found = max(found, float3(0.025, 0.025, 0.03) * level * open);
     }
-    float3 all = float3(sr.w, sg.w, sb.w) / sum;
-    found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
-    found = clamp(found, 0.2 * all, 2.5 * all);
-    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
-    float3 was = unpack(light[p]);
-    // What the program left counts as far as it can be true: the sky's light
-    // outdoors, not the blocks of other memory.
-    float top = max(dot(found, LUMA) * most, 1e-6);
-    float has = dot(was, LUMA);
-    was *= min(1.0, top / max(has, 1e-6));
-    light[p] = pack(max(was, found));
+    if (!rt_mode) {
+        if (!keep_sky_flag) {
+            light[p] = pack(found);
+            return;
+        }
+        float3 was = unpack(light[p]);
+        was = any(isnan(was)) || any(isinf(was)) ? 0.0 : was;
+        float top = max(dot(found, LUMA) * most, 1e-6);
+        float has = dot(was, LUMA);
+        was *= min(1.0, top / max(has, 1e-6));
+        light[p] = pack(max(was, found));
+    } else {
+        float3 was = unpack(light[p]);
+        was = any(isnan(was)) || any(isinf(was)) ? 0.0 : was;
+        float top = max(dot(found, LUMA) * 6.0, 4.0);
+        float has = dot(was, LUMA);
+        was *= min(1.0, top / max(has, 1e-6));
+        light[p] = pack(max(was, found * rt_floor));
+    }
 }
 #endif
 "#;
@@ -416,8 +465,9 @@ pub(crate) struct Views {
     pub(crate) image: D3D12_GPU_DESCRIPTOR_HANDLE,
     /// The scene's depth, for [`Role::Resolve`].
     pub(crate) depth: D3D12_GPU_DESCRIPTOR_HANDLE,
-    /// The size of the image, and how many slices it has.
+    /// The size of the image, the size of the depth texture, and how many slices it has.
     pub(crate) size: [u32; 2],
+    pub(crate) depth_size: [u32; 2],
     pub(crate) slices: u32,
 }
 
@@ -434,10 +484,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         Set::Estimate(level) => (level, 0.0f32),
         Set::Constant(level) => (0.0, level),
     };
-    if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
-        return false;
-    }
-    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+    let rt_mode = crate::pipeline::builder_runs();
+    let has_kept = KEPT.load(Ordering::Relaxed);
+    if role == Role::Air && (rt_mode || constant > 0.0 || air() == 0.0 || !has_kept) {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -445,14 +494,14 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
         if *said < 4 {
             *said += 1;
-            tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
+            tracing::info!(?role, size = ?views.size, depth_size = ?views.depth_size, level, constant, rt_mode, "a stand-in for the indirect light");
         }
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 12];
+    let mut words = [0u32; 16];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -461,6 +510,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    words[11] = rt_floor().to_bits();
+    words[12] = views.depth_size[0].max(1);
+    words[13] = views.depth_size[1].max(1);
+    words[14] = u32::from(rt_mode) | (u32::from(has_kept) << 1) | (u32::from(keep_sky()) << 2);
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -468,7 +521,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -486,7 +539,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
-                if constant == 0.0 {
+                if constant == 0.0 && has_kept {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
                 }

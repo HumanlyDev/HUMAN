@@ -149,7 +149,9 @@ static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 struct Through {
     buffer: ID3D12Resource,
     parts: Vec<(
+        u32,
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        u32,
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     )>,
 }
@@ -196,56 +198,79 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             None => {
                 // SAFETY: live textures.
                 let (of_from, of_to) = unsafe { (from.GetDesc(), to.GetDesc()) };
-                // Levels times layers (a volume's slices are one part).
-                let count = |d: &D3D12_RESOURCE_DESC| {
-                    let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                let layers = |d: &D3D12_RESOURCE_DESC| {
+                    if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
                         1
                     } else {
-                        u32::from(d.DepthOrArraySize)
-                    };
-                    u32::from(d.MipLevels) * layers
+                        u32::from(d.DepthOrArraySize).max(1)
+                    }
                 };
-                let parts = count(&of_from);
-                if parts == 0 || parts > ALIAS_PARTS || parts != count(&of_to) {
+                let (from_mips, to_mips) = (u32::from(of_from.MipLevels), u32::from(of_to.MipLevels));
+                let layers_from = layers(&of_from);
+                if of_from.Dimension != of_to.Dimension
+                    || layers_from != layers(&of_to)
+                    || to_mips == 0
+                    || to_mips > from_mips
+                {
                     return false;
                 }
-                let mut rows = [(); 2]
-                    .map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize]);
-                let mut bytes = [0u64; 2];
-                // SAFETY: plain queries; the out pointers are ours and
-                // hold `parts` layouts each.
-                unsafe {
-                    host.device.GetCopyableFootprints(
-                        &of_from,
-                        0,
-                        parts,
-                        0,
-                        Some(rows[0].as_mut_ptr()),
-                        None,
-                        None,
-                        Some(&mut bytes[0]),
-                    );
-                    host.device.GetCopyableFootprints(
-                        &of_to,
-                        0,
-                        parts,
-                        0,
-                        Some(rows[1].as_mut_ptr()),
-                        None,
-                        None,
-                        Some(&mut bytes[1]),
-                    );
-                }
-                let alike = rows[0].iter().zip(&rows[1]).all(|(a, b)| {
-                    let (fa, fb) = (a.Footprint, b.Footprint);
-                    a.Offset == b.Offset
-                        && (fa.Width, fa.Height, fa.Depth, fa.RowPitch)
-                            == (fb.Width, fb.Height, fb.Depth, fb.RowPitch)
-                });
-                if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
+                let parts = to_mips * layers_from;
+                if parts == 0 || parts > ALIAS_PARTS {
                     return false;
                 }
-                let Some(buffer) = host.uav_buffer(bytes[0]) else {
+                let mut pairs = Vec::with_capacity(parts as usize);
+                let mut offset = 0u64;
+                let mut total = 0u64;
+                for slice in 0..layers_from {
+                    for mip in 0..to_mips {
+                        let from_sub = slice * from_mips + mip;
+                        let to_sub = slice * to_mips + mip;
+                        let mut fp_from = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                        let mut fp_to = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                        let (mut bytes_from, mut bytes_to) = (0u64, 0u64);
+                        // SAFETY: plain queries; the out pointers are ours and
+                        // hold one layout each.
+                        unsafe {
+                            host.device.GetCopyableFootprints(
+                                &of_from,
+                                from_sub,
+                                1,
+                                0,
+                                Some(&mut fp_from),
+                                None,
+                                None,
+                                Some(&mut bytes_from),
+                            );
+                            host.device.GetCopyableFootprints(
+                                &of_to,
+                                to_sub,
+                                1,
+                                0,
+                                Some(&mut fp_to),
+                                None,
+                                None,
+                                Some(&mut bytes_to),
+                            );
+                        }
+                        let (fa, fb) = (fp_from.Footprint, fp_to.Footprint);
+                        let alike = bytes_from > 0
+                            && bytes_from == bytes_to
+                            && (fa.Width, fa.Height, fa.Depth, fa.RowPitch)
+                                == (fb.Width, fb.Height, fb.Depth, fb.RowPitch);
+                        if !alike {
+                            return false;
+                        }
+                        fp_from.Offset = offset;
+                        fp_to.Offset = offset;
+                        pairs.push((from_sub, fp_from, to_sub, fp_to));
+                        let Some(end) = offset.checked_add(bytes_from) else {
+                            return false;
+                        };
+                        total = end;
+                        offset = end.next_multiple_of(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64);
+                    }
+                }
+                let Some(buffer) = host.uav_buffer(total) else {
                     return false;
                 };
                 crate::host::name(&buffer, || {
@@ -264,10 +289,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                     read_as = of_to.Format.0,
                     "a view placed in the memory of a texture the host writes, in another format: read from that texture by a copy on the host"
                 );
-                let [of_written, of_read] = rows;
                 let through = Arc::new(Through {
                     buffer,
-                    parts: of_written.into_iter().zip(of_read).collect(),
+                    parts: pairs,
                 });
                 map.insert(placed as usize, through.clone());
                 through
@@ -294,12 +318,12 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     }
     card_writes(list, placed, to, None);
     crate::list::ensure_state(list, placed, COPY_DEST);
-    let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
+    let part = |texture: &ID3D12Resource, index: u32| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the location never releases.
         pResource: unsafe { std::mem::transmute_copy(texture) },
         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-            SubresourceIndex: index as u32,
+            SubresourceIndex: index,
         },
     };
     let rows = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
@@ -322,15 +346,15 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     unsafe {
         list.list
             .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
-        for (index, (of_written, _)) in through.parts.iter().enumerate() {
+        for (from_sub, of_written, _, _) in &through.parts {
             list.list
-                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
+                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, *from_sub), None);
         }
         list.list
             .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
-        for (index, (_, of_read)) in through.parts.iter().enumerate() {
+        for (_, _, to_sub, of_read) in &through.parts {
             list.list
-                .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
+                .CopyTextureRegion(&part(to, *to_sub), 0, 0, 0, &rows(of_read), None);
         }
         list.list
             .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
@@ -570,6 +594,15 @@ pub(crate) fn host_written(resource: This) {
     }
 }
 
+/// Invokes `f` with the host-written texture resource registered at the
+/// exact `address`, under [`HOST_WRITTEN_AT`]'s lock so the resource cannot be
+/// dropped while `f` inspects it.
+pub(crate) fn with_host_written_at<R>(address: u64, f: impl FnOnce(This) -> R) -> Option<R> {
+    let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let resource = map.get(&address).map(|d| d.5 as This)?;
+    Some(f(resource))
+}
+
 /// The title memory of textures the host copied into, by address: bytes
 /// and description words 4, 6, 7 and 8 (width, height, layers and levels,
 /// format).
@@ -583,6 +616,12 @@ static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u3
 /// card in the other texture, where no shader that reads this view finds
 /// them.
 pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
+    if crate::resource::placed_known(address, desc)
+        .and_then(crate::resource::alias_of)
+        .is_some()
+    {
+        return;
+    }
     let hit = {
         let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.range(..=address)

@@ -625,7 +625,15 @@ pub(crate) fn family(format: u32) -> u32 {
 }
 
 /// sRGB formats and their linear twins.
-pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
+pub(crate) const SRGB: [(u32, u32); 7] = [
+    (29, 28),
+    (72, 71),
+    (75, 74),
+    (78, 77),
+    (91, 87),
+    (93, 88),
+    (99, 98),
+];
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
@@ -1428,56 +1436,43 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     let whole =
         *WHOLE.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_none_or(|v| v != "1"));
     let r = resource(this);
-    // A level count of 0 asks for a full chain: not counted here.
     let one = |d: &ResourceDesc| {
+        let mips = mip_count(d);
         d.dimension != BUFFER
-            && d.mip_levels >= 1
+            && mips >= 1
             && d.depth_or_array_size >= 1
-            && (whole || (d.mip_levels == 1 && d.depth_or_array_size == 1))
+            && (whole || (mips == 1 && d.depth_or_array_size == 1))
             && d.sample_count <= 1
     };
     if !r.host.placed.load(Relaxed) || !fills(&r.desc) || !one(&r.desc) {
         return None;
     }
-    // Under the table's lock: a texture leaves it before it is freed.
-    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let other = *targets.get(&(r.data() as u64))? as This;
-    let o = resource(other);
     const DEPTH: u32 = 0x2;
-    let same = one(&o.desc)
-        && o.desc.dimension == r.desc.dimension
-        && o.desc.width == r.desc.width
-        && o.desc.height == r.desc.height
-        && o.desc.mip_levels == r.desc.mip_levels
-        && o.desc.depth_or_array_size == r.desc.depth_or_array_size
-        && o.desc.flags & DEPTH == 0
-        && target_format(o.desc.format) == o.desc.format
-        && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
-    if !same && r.desc.sample_count <= 1 {
-        // What shaders wrote there is on the card in the other texture; this
-        // one is filled from title memory, which they never reached. Each
-        // kind of pair is said once.
-        static SAID: std::sync::Mutex<std::collections::BTreeSet<[u32; 6]>> =
-            std::sync::Mutex::new(std::collections::BTreeSet::new());
-        let pair = [
-            r.desc.width as u32,
-            r.desc.height,
-            r.desc.format,
-            o.desc.width as u32,
-            o.desc.height,
-            o.desc.format,
-        ];
-        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-        if said.len() < 64 && said.insert(pair) {
-            tracing::warn!(
-                view = ?this,
-                texture = ?other,
-                "a placed texture lies where a texture the host writes does, and is not like it (width, height, format of each): {pair:?}, levels {} and {}, layers {} and {}",
-                r.desc.mip_levels, o.desc.mip_levels, r.desc.depth_or_array_size, o.desc.depth_or_array_size
-            );
+    let r_mips = mip_count(&r.desc);
+    let matches_source = |other: This| -> Option<This> {
+        if other.is_null() || other == this {
+            return None;
         }
-    }
-    same.then_some(other)
+        let o = resource(other);
+        let o_mips = mip_count(&o.desc);
+        let same = one(&o.desc)
+            && o.desc.dimension == r.desc.dimension
+            && o.desc.width == r.desc.width
+            && o.desc.height == r.desc.height
+            && r_mips <= o_mips
+            && o.desc.depth_or_array_size == r.desc.depth_or_array_size
+            && o.desc.flags & DEPTH == 0
+            && target_format(o.desc.format) == o.desc.format
+            && element(o.desc.format).is_some_and(|e| Some(e) == element(r.desc.format));
+        same.then_some(other)
+    };
+    let at = r.data() as u64;
+    // Under each table's lock: a texture leaves it before it is freed.
+    let target = {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        targets.get(&at).copied().and_then(|o| matches_source(o as This))
+    };
+    target.or_else(|| crate::texture::with_host_written_at(at, matches_source).flatten())
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -2795,6 +2790,7 @@ impl Drop for Resource {
                 }
             }
         }
+        crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         let made = self
             .host
             .made
@@ -2826,7 +2822,6 @@ impl Drop for Resource {
                 crate::host::retire(twin);
             }
         }
-        crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(
@@ -3140,11 +3135,12 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
-    crate::texture::placed_in_host_written(address, desc);
     resource(out)
         .host
         .placed
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    drop(map);
+    crate::texture::placed_in_host_written(address, desc);
     Some(out)
 }
 

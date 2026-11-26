@@ -50,8 +50,8 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
-    /// Bit n: immediate sampler n is a comparison sampler.
-    pub cmp_samplers: u64,
+    /// Per-slot flag: immediate sampler `n` is a comparison sampler.
+    pub cmp_samplers: Vec<bool>,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
@@ -2440,7 +2440,7 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
-        let cmp_samplers = self.s.cmp_samplers;
+        let cmp_samplers = std::mem::take(&mut self.s.cmp_samplers);
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
@@ -7382,16 +7382,13 @@ impl<'a> Lower<'a> {
             .samplers
             .iter()
             .enumerate()
-            .position(|(n, w)| *w == words && (self.s.cmp_samplers >> n & 1 != 0) == cmp);
+            .position(|(n, w)| *w == words && self.s.cmp_samplers.get(n).copied().unwrap_or(false) == cmp);
         let n = match slot {
             Some(n) => n,
             None => {
                 let n = self.samplers.len();
-                if n >= u64::BITS as usize {
-                    return Err("more than 64 immediate sampler slots");
-                }
                 self.samplers.push(words);
-                self.s.cmp_samplers |= u64::from(cmp) << n;
+                self.s.cmp_samplers.push(cmp);
                 n
             }
         };
@@ -13421,5 +13418,47 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn same_immediate_sampler_used_with_and_without_comparison_gets_two_slots() {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+            0xBE90_0380, // s_mov_b32 s16, 0
+            0xBE91_0380, // s_mov_b32 s17, 0
+            0xBE92_0380, // s_mov_b32 s18, 0
+            0xBE93_0380, // s_mov_b32 s19, 0
+            0xF09C_0F08,
+            0x0082_0402, // image_sample_lz v[4:7], v[2:3], s[8:15], s[16:19]
+            0xF0BC_0108,
+            0x0082_0801, // image_sample_c_lz v8, v[1:3], s[8:15], s[16:19] (dmask = 0x1)
+            0xD834_0000,
+            0x0000_0400, // ds_write_b32 v0, v4
+            0xD834_0000,
+            0x0000_0800, // ds_write_b32 v0, v8
+            S_ENDPGM,
+        ];
+        let out = lower_with(
+            &words,
+            vec![root(RootType::Table, 0, 0)],
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            }],
+        )
+        .expect("mixed comparison and non-comparison immediate sampler");
+        assert_eq!(out.samplers.len(), 2);
+        assert_eq!(out.samplers[0], out.samplers[1]);
+        assert_eq!(out.cmp_samplers, vec![false, true]);
+        assert!(crate::Container::parse(&out.dxil).is_ok());
     }
 }

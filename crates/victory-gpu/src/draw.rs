@@ -1472,6 +1472,12 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
+        if self.depth != 0 {
+            // A depth texture shaders also write: sync what they wrote
+            // before binding, marking depth as written only when depth writes
+            // are enabled.
+            list.twin_use(self.depth as This, false, self.depth_state != DEPTH_READ);
+        }
         if !self.bind(list, p, false) {
             return false;
         }
@@ -1522,8 +1528,6 @@ impl State {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
-            // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(self.depth as This, false, true);
             // A view that writes neither plane keeps the texture readable:
             // the depth read state, together with the shader read states
             // if this draw's shaders read the same texture (the write state
@@ -1555,6 +1559,9 @@ impl State {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
+        if list.take_plane_clobbered() {
+            self.replay(list);
+        }
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1837,6 +1844,12 @@ impl State {
                     return false;
                 }
             }
+        }
+        // If a table/resource SRV triggered an inline depth-plane pass,
+        // restore title graphics/compute bindings and re-bind cleanly once.
+        if list.take_plane_clobbered() {
+            self.replay(list);
+            return self.bind(list, p, compute);
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
@@ -3099,6 +3112,13 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
+        // A program that walks ray-tracing structures nothing has built.
+        if crate::pipeline::walk_held(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("a walk of ray-tracing structures that are not built (VICTORY_BVH_HOLD=0 to allow)".to_owned());
+            return;
+        }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3220,7 +3240,7 @@ impl State {
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = if role == Role::Resolve { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
+        if of.Format.0 != format || seen.Width == 0 || seen.Height == 0 || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
             return false;
         }
@@ -3228,6 +3248,7 @@ impl State {
             image,
             depth,
             size: [of.Width as u32, of.Height],
+            depth_size: [seen.Width as u32, seen.Height],
             slices: u32::from(of.DepthOrArraySize),
         })
     }
@@ -4187,6 +4208,11 @@ impl State {
         if crate::pipeline::is_rt_gi_skipped(self.pipeline as This) {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
+            return false;
+        }
+        if crate::pipeline::walk_held(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("a walk of ray-tracing structures that are not built (VICTORY_BVH_HOLD=0 to allow)".to_owned());
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
