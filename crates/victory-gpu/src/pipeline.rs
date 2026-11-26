@@ -69,6 +69,10 @@ pub(crate) struct Shader {
     pub(crate) skip_rt_non_gi: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Whether its code walks the ray-tracing structures, once looked at
+    /// ([`Shader::walks`]).
+    #[cfg(windows)]
+    walks: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -123,6 +127,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 skip_rt_non_gi: stage == "compute" && rt_gi::skip_non_gi_trace(bytes),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                walks: OnceLock::new(),
             })
         })
         .clone()
@@ -199,6 +205,66 @@ impl Shader {
         let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
         victory_shader::native_programs(part.data).ok()
     }
+
+    /// Whether the program walks the ray-tracing structures: its code has
+    /// an `image_bvh_intersect_ray` or `image_bvh64_intersect_ray`. Looked
+    /// at once, when a dispatch first asks.
+    fn walks(&self) -> bool {
+        *self.walks.get_or_init(|| container_walks(&self.container))
+    }
+}
+
+/// Whether a console container's code tests rays against the nodes of a
+/// ray-tracing structure.
+#[cfg(windows)]
+fn container_walks(container: &[u8]) -> bool {
+    use victory_shader::{Container, FourCC};
+    let Ok(c) = Container::parse(container) else {
+        return false;
+    };
+    c.part(FourCC::DXIL)
+        .or(c.part(FourCC::ACCC))
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(|p| code_walks(&p.code)))
+}
+
+/// Whether native code has a ray-tracing node test.
+#[cfg(windows)]
+fn code_walks(code: &[u8]) -> bool {
+    victory_shader::gfx10::decode(code)
+        .is_ok_and(|code| code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh"))))
+}
+
+/// Dispatches held back by [`walk_held`] since the last frame line.
+#[cfg(windows)]
+pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a dispatch with the title's pipeline `this` is held back
+/// because its program walks ray-tracing structures nothing has built
+/// (`VICTORY_BVH_HOLD=0` runs them anyway; on by default).
+#[cfg(windows)]
+pub(crate) fn walk_held(this: This) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if this.is_null() || !*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HOLD").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    let p = pipeline(this);
+    if !p.shaders.iter().any(|s| s.stage == "compute" && s.walks()) {
+        return false;
+    }
+    if BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole {
+        return false;
+    }
+    if WALKS_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::info!(
+                shaders = ?p.shaders,
+                "a dispatch of a program that walks ray-tracing structures is held back: the structure builder has not built them (VICTORY_BVH_HOLD=0 to allow); the first one"
+            );
+        });
+    }
+    true
 }
 
 #[cfg(windows)]
