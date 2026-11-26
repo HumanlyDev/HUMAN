@@ -129,6 +129,9 @@ fn ask(shader: Arc<crate::pipeline::Shader>) {
                 if let Some(t) = shader.translated() {
                     t.picks.store(if yes { YES } else { NO }, Relaxed);
                 }
+                if !crate::pipeline::known::on() {
+                    shader.release_container();
+                }
             }
         });
         Mutex::new(send)

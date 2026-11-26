@@ -1258,12 +1258,41 @@ mod relay_tests {
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// Timestamp (`crate::host::moment`) of the last snapshot buffer checkout.
+static POOL_USED: AtomicU64 = AtomicU64::new(0);
+
+fn snapshot_pool_limit(limited: bool, pressured: bool) -> usize {
+    if pressured {
+        0
+    } else if limited {
+        128 << 20
+    } else {
+        512 << 20
+    }
+}
+
+fn trim_pool_to_limit(pool: &mut Vec<Vec<u8>>, limit: usize, max_count: usize) -> Vec<Vec<u8>> {
+    if limit == 0 || max_count == 0 {
+        return std::mem::take(pool);
+    }
+    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    let (mut kept, mut total) = (0, 0usize);
+    for v in pool.iter().take(max_count) {
+        total = total.saturating_add(v.capacity());
+        if kept > 0 && total > limit {
+            break;
+        }
+        kept += 1;
+    }
+    pool.split_off(kept)
+}
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one
 /// of about that size: a small copy's snapshot took the 174 MB buffer kept
 /// for the big heap's, which then got another, until eight of them were
 /// reserved (1.4 GB in run 24).
 fn pooled(n: usize) -> Vec<u8> {
+    POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let most = n.saturating_mul(4).max(1 << 20);
     let fit = pool
@@ -1295,25 +1324,45 @@ fn snapshots_kept() -> usize {
 }
 
 /// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
-/// the largest, and of those the largest one and the next ones up to `KEPT`
-/// bytes in all.
+/// the largest, and of those the largest one and the next ones up to the
+/// host-pressure-adjusted byte limit in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let (mut kept, mut total) = (0, 0usize);
-    for v in pool.iter().take(snapshots_kept()) {
-        total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
-            break;
-        }
-        kept += 1;
+    let limit = snapshot_pool_limit(crate::residency::limited_host_ram(), crate::residency::pressured());
+    if limit == 0 {
+        drop(v);
+        return;
     }
+    let gone = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        pool.push(v);
+        trim_pool_to_limit(&mut pool, limit, snapshots_kept())
+    };
     // (Given back to the kernel without the lock: milliseconds.)
-    let gone = pool.split_off(kept);
-    drop(pool);
     drop(gone);
+}
+
+fn trim_snapshot_pool(idle_ms: u64, idle_frames: u64) {
+    let pressured = crate::residency::pressured();
+    let idle = crate::host::long_ago(POOL_USED.load(Ordering::Relaxed), idle_ms, idle_frames);
+    let gone = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.is_empty() {
+            return;
+        }
+        if pressured || idle {
+            std::mem::take(&mut *pool)
+        } else {
+            let limit = snapshot_pool_limit(crate::residency::limited_host_ram(), false);
+            trim_pool_to_limit(&mut pool, limit, snapshots_kept())
+        }
+    };
+    if !gone.is_empty() {
+        let (count, bytes) = (gone.len(), gone.iter().map(|v| v.capacity() as u64).sum::<u64>());
+        crate::host::trail(|| {
+            format!("sweep: {count} idle snapshot buffers trimmed ({} KiB)", bytes >> 10)
+        });
+        drop(gone);
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -2810,24 +2859,25 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    let idle_ms = crate::host::ram_idle_ms(crate::residency::headroom());
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
-            return;
+            Vec::new()
+        } else {
+            let idle: Vec<(u64, u64)> = map
+                .iter()
+                .filter(|(_, s)| {
+                    Arc::strong_count(s) == 1
+                        && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                        && crate::host::references(&s.buffer) == 1
+                })
+                .map(|(key, _)| *key)
+                .collect();
+            idle.into_iter().filter_map(|key| map.remove(&key)).collect()
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-        let idle: Vec<(u64, u64)> = map
-            .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
-            })
-            .map(|(key, _)| *key)
-            .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -2842,6 +2892,40 @@ pub(crate) fn let_go_idle() {
         // submission is running after all.
         crate::host::retire(shadow);
     }
+
+    let gone_exact: Vec<Arc<Shadow>> = {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, map) = &mut *guard;
+        if map.is_empty() {
+            Vec::new()
+        } else {
+            let idle: Vec<(u64, u64)> = map
+                .iter()
+                .filter(|(_, (s, _))| {
+                    Arc::strong_count(s) == 1
+                        && crate::host::references(&s.buffer) == 1
+                        && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                })
+                .map(|(key, _)| *key)
+                .collect();
+            idle.into_iter()
+                .filter_map(|key| map.remove(&key).map(|(s, _)| s))
+                .collect()
+        }
+    };
+    if !gone_exact.is_empty() {
+        let (went, bytes) = (gone_exact.len(), gone_exact.iter().map(|s| s.len).sum::<u64>());
+        crate::host::trail(|| {
+            format!("sweep: {went} exact view copies of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
+        });
+    }
+    for shadow in gone_exact {
+        LET_GO[0].fetch_add(1, Ordering::Relaxed);
+        LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
+        crate::host::retire(shadow);
+    }
+
+    trim_snapshot_pool(idle_ms, IDLE_FRAMES);
 }
 
 /// For the memory line: host copies alive and their bytes, of them the
@@ -5378,6 +5462,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
+    let mut evicted = Vec::new();
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     let (tick, map) = &mut *guard;
     *tick += 1;
@@ -5390,11 +5475,31 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if map.len() >= many {
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + lately > now
-        });
+        let stale: Vec<(u64, u64)> = map
+            .iter()
+            .filter(|(_, (shadow, used))| {
+                Arc::strong_count(shadow) <= 1
+                    && crate::host::references(&shadow.buffer) <= 1
+                    && *used + lately <= now
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        evicted.extend(stale.into_iter().filter_map(|k| map.remove(&k).map(|(s, _)| s)));
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    let Some(host) = host() else {
+        drop(guard);
+        for shadow in evicted {
+            crate::host::retire(shadow);
+        }
+        return None;
+    };
+    let Some((buffer, data)) = host.shared_buffer(len.next_multiple_of(256)) else {
+        drop(guard);
+        for shadow in evicted {
+            crate::host::retire(shadow);
+        }
+        return None;
+    };
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5402,6 +5507,10 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
+    drop(guard);
+    for old in evicted {
+        crate::host::retire(old);
+    }
     Some(shadow)
 }
 
@@ -5561,6 +5670,30 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    #[test]
+    fn snapshot_pool_limit_and_trim_respect_pressure() {
+        assert_eq!(super::snapshot_pool_limit(false, false), 512 << 20);
+        assert_eq!(super::snapshot_pool_limit(true, false), 128 << 20);
+        assert_eq!(super::snapshot_pool_limit(false, true), 0);
+        assert_eq!(super::snapshot_pool_limit(true, true), 0);
+
+        let mut pool = vec![
+            Vec::<u8>::with_capacity(1024),
+            Vec::<u8>::with_capacity(4096),
+            Vec::<u8>::with_capacity(2048),
+        ];
+        // Under limit of 5000 bytes, largest buffers (4096) stay while tail (2048, 1024) trims.
+        let evicted = super::trim_pool_to_limit(&mut pool, 5000, 16);
+        assert_eq!(pool.len(), 1);
+        assert!(pool[0].capacity() >= 4096);
+        assert_eq!(evicted.len(), 2);
+
+        // Pressured / idle limit (0 bytes) evicts everything.
+        let evicted_all = super::trim_pool_to_limit(&mut pool, 0, 16);
+        assert!(pool.is_empty());
+        assert_eq!(evicted_all.len(), 1);
     }
 }
 

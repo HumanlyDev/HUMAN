@@ -6192,6 +6192,30 @@ impl Host {
     }
 }
 
+fn trim_hash_map<K: Eq + std::hash::Hash, V>(
+    map: &mut std::collections::HashMap<K, V>,
+    max_cap: usize,
+    keep_cap: usize,
+    pressured: bool,
+) {
+    map.clear();
+    if pressured && map.capacity() > 0 {
+        map.shrink_to_fit();
+    } else if map.capacity() > max_cap {
+        map.shrink_to(keep_cap);
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn trim_vec<T>(vec: &mut Vec<T>, max_cap: usize, keep_cap: usize, pressured: bool) {
+    vec.clear();
+    if pressured && vec.capacity() > 0 {
+        vec.shrink_to_fit();
+    } else if vec.capacity() > max_cap {
+        vec.shrink_to(keep_cap);
+    }
+}
+
 impl HostList {
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
@@ -6327,15 +6351,44 @@ impl HostList {
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
+        let pressured = crate::residency::pressured();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
-        self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        trim_hash_map(
+            &mut self.states.lock().unwrap_or_else(|e| e.into_inner()),
+            256,
+            64,
+            pressured,
+        );
+        trim_hash_map(
+            &mut self.twins.lock().unwrap_or_else(|e| e.into_inner()),
+            64,
+            16,
+            pressured,
+        );
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
-        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        trim_vec(
+            &mut self.notes.lock().unwrap_or_else(|e| e.into_inner()),
+            256,
+            64,
+            pressured,
+        );
+        if pressured {
+            let trimmed_indirect = {
+                let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+                if slot.as_ref().is_some_and(|(_, size)| *size > 256 << 10) {
+                    slot.take().map(|(buf, _)| buf)
+                } else {
+                    None
+                }
+            };
+            if let Some(buffer) = trimmed_indirect {
+                retire_resource(buffer);
+            }
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -10714,6 +10767,30 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn host_list_trim_hash_map_bounds_oversized_capacity() {
+        let mut small: std::collections::HashMap<usize, u32> = std::collections::HashMap::with_capacity(32);
+        small.insert(1, 10);
+        let initial_small_cap = small.capacity();
+        super::trim_hash_map(&mut small, 256, 64, false);
+        assert!(small.is_empty());
+        assert_eq!(small.capacity(), initial_small_cap);
+
+        let mut big: std::collections::HashMap<usize, u32> = std::collections::HashMap::with_capacity(1024);
+        big.insert(1, 10);
+        let big_cap = big.capacity();
+        assert!(big_cap > 256);
+        super::trim_hash_map(&mut big, 256, 64, false);
+        assert!(big.is_empty());
+        assert!(big.capacity() < big_cap);
+
+        let mut pressured: std::collections::HashMap<usize, u32> = std::collections::HashMap::with_capacity(64);
+        pressured.insert(1, 10);
+        super::trim_hash_map(&mut pressured, 256, 64, true);
+        assert!(pressured.is_empty());
+        assert_eq!(pressured.capacity(), 0);
     }
 }
 
