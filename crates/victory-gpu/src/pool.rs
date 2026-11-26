@@ -43,7 +43,8 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    let limited = crate::residency::limited_host_ram();
+    let limit = spares(memory, crate::host::keep_freed() && !pressure && !limited);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
     // A full pool can become idle while another subsystem needs the VRAM.
@@ -56,6 +57,8 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
             0
         } else if pressure {
             1
+        } else if limited {
+            limit.min(2)
         } else {
             limit
         };
@@ -98,7 +101,12 @@ pub(crate) fn on() -> bool {
 /// no such lists: pieces are cut from those first.
 fn ahead() -> usize {
     static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *AHEAD.get_or_init(|| std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12))
+    *AHEAD.get_or_init(|| {
+        std::env::var("VICTORY_RIPE_BLOCKS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| if crate::residency::limited_host_ram() { 2 } else { 12 })
+    })
 }
 
 /// Submissions begun and finished ([`crate::host::submissions`]), and how

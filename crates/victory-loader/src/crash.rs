@@ -152,6 +152,12 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
             return false;
         }
         let code = context.Rip as *const u8;
+        // Only bytes inside the faulting instruction's page are read: the next
+        // page may not be mapped.
+        let room = 0x1000 - (context.Rip as usize & 0xfff);
+        if room < 3 {
+            return false;
+        }
         match code.cast::<[u8; 3]>().read_unaligned() {
             [0x0f, 0x01, 0xfc] => return clzero(context),
             [0x0f, 0x01, 0xfa] => {}
@@ -165,9 +171,6 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                 context.Rdx = cycles >> 32;
             }
             _ => {
-                // Only bytes inside the faulting instruction's page are read: the next page may
-                // not be mapped.
-                let room = 0x1000 - (context.Rip as usize & 0xfff);
                 let mut bytes = [0u8; 32];
                 let n = room.min(bytes.len());
                 std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
@@ -188,7 +191,8 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     context.Rip += len as u64;
                     return true;
                 }
-                let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
+                let Some(len) = sse4a(&bytes[..n], &mut context.Anonymous.FltSave.XmmRegisters)
+                else {
                     return false;
                 };
                 context.Rip += len as u64;
@@ -317,6 +321,21 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
 /// # Safety
 /// `context` is the state of a thread that faulted at a `clzero`; the
 /// lines its registers name are the title's to zero.
+/// Whether a `clzero` loop starting at `base` with `jb` limit `limit` finishes
+/// without wrapping past `u64::MAX`. Returns `None` if `add ..., 0x40` would
+/// overflow, so the handler falls back to single-instruction `clzero`
+/// emulation instead of spinning in a wrapped loop.
+fn clzero_loop_viable(base: u64, limit: u64) -> bool {
+    if base >= limit {
+        base.checked_add(0x40).is_some()
+    } else {
+        ((limit - base).div_ceil(0x40))
+            .checked_mul(0x40)
+            .and_then(|step| base.checked_add(step))
+            .is_some()
+    }
+}
+
 unsafe fn clzero(context: &mut CONTEXT) -> bool {
     // SAFETY: (every use) a line the title asked to zero.
     let zero = |rax: u64| unsafe { ((rax & !63) as *mut u8).write_bytes(0, 64) };
@@ -330,6 +349,7 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
         if let [0x48, 0x83, 0xc0, 0x40, cmp @ .., 0x72, 0xf4] = after
             && let Some((0, limit)) = compare_registers(cmp)
             && limit != 0
+            && clzero_loop_viable(context.Rax, *gpr(context, limit))
         {
             let limit = *gpr(context, limit);
             loop {
@@ -357,6 +377,7 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
             && a == add & 7 | (add_rex & 1) << 3
             && a != 0
             && b != 0
+            && clzero_loop_viable(*gpr(context, a), *gpr(context, b))
         {
             let limit = *gpr(context, b);
             loop {
@@ -423,27 +444,26 @@ pub(crate) const CMP_FLAGS: u32 = 0x8d5;
 
 /// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
 /// the saved XMM registers; returns the instruction's length.
-unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
-    // SAFETY: the caller's code bytes are readable up to the instruction's end.
-    let b = |i: usize| unsafe { code.add(i).read() };
-    let prefix = b(0);
-    let (rex, at) = if b(1) & 0xf0 == 0x40 {
-        (b(1), 2)
+fn sse4a(code: &[u8], xmm: &mut [M128A; 16]) -> Option<usize> {
+    let b = |i: usize| code.get(i).copied();
+    let prefix = b(0)?;
+    let (rex, at) = if b(1)? & 0xf0 == 0x40 {
+        (b(1)?, 2)
     } else {
         (0, 1)
     };
-    if !matches!(prefix, 0x66 | 0xf2) || b(at) != 0x0f || !matches!(b(at + 1), 0x78 | 0x79) {
+    if !matches!(prefix, 0x66 | 0xf2) || b(at)? != 0x0f || !matches!(b(at + 1)?, 0x78 | 0x79) {
         return None;
     }
-    let modrm = b(at + 2);
+    let modrm = b(at + 2)?;
     if modrm >> 6 != 3 {
         return None;
     }
     let dst = usize::from((modrm >> 3) & 7 | (rex & 4) << 1);
     let src = usize::from(modrm & 7 | (rex & 1) << 3);
-    let immediate = b(at + 1) == 0x78;
+    let immediate = b(at + 1)? == 0x78;
     let (fields, len) = if immediate {
-        ((b(at + 3), b(at + 4)), at + 5)
+        ((b(at + 3)?, b(at + 4)?), at + 5)
     } else {
         // extrq reads its fields from src's low half, insertq from its high.
         let f = if prefix == 0x66 { xmm[src].Low } else { xmm[src].High as u64 };
@@ -525,12 +545,23 @@ const CPP_MAGIC: usize = 0x1993_0520;
 /// # Safety
 /// `p` are the parameters of a live MSVC throw (`p[0]` the magic).
 unsafe fn thrown(p: &[usize]) -> String {
+    if p.len() < 4 || p[2] == 0 || p[3] == 0 {
+        return "rethrow".into();
+    }
     // SAFETY: the throw's ThrowInfo, its RVAs relative to `p[3]`: catchable
     // type array at +12 (count, then type RVAs), each type's descriptor at
     // +4, whose decorated name starts at +16; the object is at `p[1]`.
     unsafe {
         let rva = |at: usize| (at as *const u32).read_unaligned() as usize;
-        let types = p[3] + rva(p[2] + 12);
+        let types_rva = rva(p[2] + 12);
+        if types_rva == 0 {
+            return "unknown".into();
+        }
+        let types = p[3] + types_rva;
+        let count = rva(types).min(32);
+        if count == 0 {
+            return "unknown".into();
+        }
         let name = |i: usize| {
             let descriptor = p[3] + rva(p[3] + rva(types + 4 + 4 * i) + 4);
             std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char)
@@ -543,7 +574,7 @@ unsafe fn thrown(p: &[usize]) -> String {
                 format!(" = {:#010x}", (p[1] as *const u32).read_unaligned())
             }
             // std::exception keeps its message after the table pointer.
-            _ if (0..rva(types)).any(|i| name(i) == ".?AVexception@std@@") => {
+            _ if p[1] != 0 && (0..count).any(|i| name(i) == ".?AVexception@std@@") => {
                 let message = (p[1] as *const *const std::ffi::c_char).add(1).read();
                 if message.is_null() {
                     String::new()
@@ -1449,6 +1480,95 @@ mod tests {
             end.copy_from_nonoverlapping(code.as_ptr(), 3);
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn clzero_loop_wrapping_ranges_fall_back_to_single_line() {
+        assert!(clzero_loop_viable(0x1000, 0x1080));
+        assert!(clzero_loop_viable(0x10c0, 0x1080));
+        assert!(!clzero_loop_viable(0, u64::MAX - 10));
+        assert!(!clzero_loop_viable(u64::MAX - 16, 0x100));
+        assert!(!clzero_loop_viable(u64::MAX - 63, u64::MAX));
+
+        #[repr(align(64))]
+        struct Lines([u8; 128]);
+        let mut mem = Lines([0xff; 128]);
+        let start = mem.0.as_mut_ptr() as u64;
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rax = start;
+        context.R10 = u64::MAX - 10;
+        let code = [
+            0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4,
+        ];
+        assert!(emulate_in(&code, 0, &mut context));
+        // Only the 3-byte `clzero` runs when the loop range would wrap u64::MAX.
+        assert_eq!((context.Rip, context.Rax), (3, start));
+        assert!(mem.0[..64].iter().all(|&b| b == 0));
+        assert!(mem.0[64..].iter().all(|&b| b == 0xff));
+    }
+
+    #[test]
+    fn sse4a_and_short_tail_at_page_end_do_not_read_into_next_page() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        // SAFETY: two pages of ours, the second unreadable.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x2000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!page.is_null());
+            let mut old = 0;
+            let guard = page.add(0x1000).cast();
+            assert_ne!(VirtualProtect(guard, 0x1000, PAGE_NOACCESS, &mut old), 0);
+
+            // 1. 2-byte illegal instruction at the very end of the page must not read a 3rd byte.
+            let two_byte = page.add(0x1000 - 2);
+            two_byte.copy_from_nonoverlapping([0x0f_u8, 0x0b].as_ptr(), 2);
+            let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+            record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rip = two_byte as u64;
+            let mut pointers = EXCEPTION_POINTERS {
+                ExceptionRecord: &mut record,
+                ContextRecord: &mut context,
+            };
+            assert!(!emulate_amd_only(&mut pointers));
+
+            // 2. Truncated 4-byte prefix of an immediate 6-byte `extrq` at page end returns false without faulting.
+            let truncated_sse4a = page.add(0x1000 - 4);
+            truncated_sse4a.copy_from_nonoverlapping([0x66_u8, 0x0f, 0x78, 0xc0].as_ptr(), 4);
+            context.Rip = truncated_sse4a as u64;
+            assert!(!emulate_amd_only(&mut pointers));
+
+            // 3. Complete 4-byte register `extrq xmm0, xmm1` at page end succeeds without reading past page end.
+            let reg_extrq = page.add(0x1000 - 4);
+            reg_extrq.copy_from_nonoverlapping([0x66_u8, 0x0f, 0x79, 0xc1].as_ptr(), 4);
+            context.Rip = reg_extrq as u64;
+            context.Anonymous.FltSave.XmmRegisters[0] = reg(0x1111_2222_abcd_4444, 0);
+            context.Anonymous.FltSave.XmmRegisters[1] = reg(0x14_08, 0);
+            assert!(emulate_amd_only(&mut pointers));
+            assert_eq!(context.Rip, reg_extrq as u64 + 4);
+            assert_eq!(context.Anonymous.FltSave.XmmRegisters[0].Low, 0xbc);
+
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn thrown_handles_rethrow_and_null_throw_info() {
+        // SAFETY: null ThrowInfo / image-base parameters are rejected before dereferencing.
+        unsafe {
+            assert_eq!(thrown(&[CPP_MAGIC, 0, 0, 0]), "rethrow");
+            assert_eq!(thrown(&[CPP_MAGIC, 0x1234, 0, 0x1000]), "rethrow");
+            assert_eq!(thrown(&[CPP_MAGIC, 0x1234, 0x1000, 0]), "rethrow");
         }
     }
 }
