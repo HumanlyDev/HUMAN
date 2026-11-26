@@ -9000,6 +9000,8 @@ impl Host {
                 D3D12_RESOURCE_STATES(over_state as i32),
                 crate::compose::view(&desc)?,
                 crate::compose::view(&over_desc)?,
+                over_desc.Width as u32,
+                over_desc.Height,
             ))
         });
         let format = if planes.is_some() {
@@ -9011,7 +9013,12 @@ impl Host {
             };
             format
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        let (width, height) = match planes {
+            Some((_, _, _, _, over_w, over_h)) => {
+                ((desc.Width as u32).max(over_w), desc.Height.max(over_h))
+            }
+            None => (desc.Width as u32, desc.Height),
+        };
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -9105,14 +9112,15 @@ impl Host {
             copy.reset();
             copy.keep(texture);
             let list = &copy.list;
-            let composed = if let Some((over, over_state, base_fmt, over_fmt)) = planes {
+            let composed = if let Some((over, over_state, base_fmt, over_fmt, _, _)) = planes {
                 copy.keep(over);
                 if let Some(composer) = p.composer.as_mut() {
+                    let same_resource = over.as_raw() == texture.as_raw();
                     let mut pre = Vec::with_capacity(3);
                     if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                         pre.push(transition(texture, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
                     }
-                    if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                    if !same_resource && over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                         pre.push(transition(over, over_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
                     }
                     pre.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
@@ -9147,7 +9155,7 @@ impl Host {
                     if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                         post.push(transition(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, state));
                     }
-                    if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                    if !same_resource && over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                         post.push(transition(over, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, over_state));
                     }
                     post.push(transition(
