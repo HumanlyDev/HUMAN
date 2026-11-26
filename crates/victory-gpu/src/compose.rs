@@ -76,7 +76,56 @@ impl Composer {
                 std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
             };
             let device = &host.device;
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&vs))?;
+            let range = D3D12_DESCRIPTOR_RANGE1 {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 2,
+                BaseShaderRegister: 0,
+                RegisterSpace: 0,
+                Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                    | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+            };
+            let param = D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: &range,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            };
+            let sampler = D3D12_STATIC_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+                BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+                MinLOD: 0.0,
+                MaxLOD: D3D12_FLOAT32_MAX,
+                ShaderRegister: 0,
+                RegisterSpace: 0,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            };
+            let root_desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+                Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+                Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                    Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                        NumParameters: 1,
+                        pParameters: &param,
+                        NumStaticSamplers: 1,
+                        pStaticSamplers: &sampler,
+                        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+                    },
+                },
+            };
+            let mut root_blob: Option<ID3DBlob> = None;
+            D3D12SerializeVersionedRootSignature(&root_desc, &mut root_blob, None)?;
+            let root_blob = root_blob.ok_or_else(windows::core::Error::empty)?;
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&root_blob))?;
             let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
                 pShaderBytecode: b.GetBufferPointer(),
                 BytecodeLength: b.GetBufferSize(),
@@ -201,12 +250,28 @@ pub(crate) fn view(d: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
         return None;
     }
     match d.Format.0 {
+        1 => Some(DXGI_FORMAT_R32G32B32A32_FLOAT),
         9 => Some(DXGI_FORMAT_R16G16B16A16_FLOAT),
         23 => Some(DXGI_FORMAT_R10G10B10A2_UNORM),
         27 => Some(DXGI_FORMAT_R8G8B8A8_UNORM),
         90 => Some(DXGI_FORMAT_B8G8R8A8_UNORM),
-        10 | 11 | 13 | 24 | 26 | 28 | 29 | 31 | 67 | 87 | 91 => Some(d.Format),
+        92 => Some(DXGI_FORMAT_B8G8R8X8_UNORM),
+        2 | 10 | 11 | 13 | 24 | 26 | 28 | 29 | 31 | 67 | 87 | 88 | 91 | 93 => Some(d.Format),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn composer_builds_pipeline_state() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        Composer::new(host, DXGI_FORMAT_R8G8B8A8_UNORM)
+            .expect("create two-plane composer root signature and pipeline state");
     }
 }
 

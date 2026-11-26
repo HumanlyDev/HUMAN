@@ -1107,11 +1107,13 @@ extern "system" fn heap_query(this: This, iid: *const Iid, out: *mut This) -> HR
 extern "system" fn heap_release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
-extern "system" fn heap_desc(this: This, out: *mut HeapDesc) {
+/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+extern "system" fn heap_desc(this: This, out: *mut HeapDesc) -> *mut HeapDesc {
     if !out.is_null() {
         // SAFETY: `this` is a heap; the title passes room for a description.
         unsafe { out.write((*this.cast::<Heap>()).desc) };
     }
+    out
 }
 
 /// A resource's memory: its own, or a range of a heap it holds a reference
@@ -2387,6 +2389,64 @@ pub(crate) fn is_resource(this: This) -> bool {
         && usize::from_ne_bytes(table) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
 }
 
+/// Resolves a resource passed to `PresentX` to a live rendered/written title
+/// texture at the same console GPU address when `this` itself has no rendered
+/// host texture (for example, a display-plane alias placed over a render target).
+#[cfg(windows)]
+pub(crate) fn present_target(this: This) -> This {
+    if this.is_null() {
+        return this;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return this;
+    }
+    let has_written_host = !fills(&r.desc)
+        && r.host
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+    if has_written_host {
+        return this;
+    }
+    let at = r.data() as usize;
+    if at == 0 {
+        return this;
+    }
+    const DEPTH: u32 = 0x2;
+    let same_shape = |o: &ResourceDesc| {
+        !fills(o)
+            && o.flags & DEPTH == 0
+            && o.dimension == r.desc.dimension
+            && o.width == r.desc.width
+            && o.height == r.desc.height
+            && o.mip_levels == r.desc.mip_levels
+            && o.depth_or_array_size == r.desc.depth_or_array_size
+            && o.sample_count == r.desc.sample_count
+            && element(o.format).is_some_and(|e| Some(e) == element(r.desc.format))
+    };
+    let live = textures();
+    for &candidate in live.iter() {
+        if candidate == this as usize {
+            continue;
+        }
+        let other = resource(candidate as This);
+        if other.data() as usize == at
+            && same_shape(&other.desc)
+            && other
+                .host
+                .made
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+        {
+            return candidate as This;
+        }
+    }
+    this
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
@@ -3157,11 +3217,13 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
     S_OK
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
-extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
+/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) -> *mut ResourceDesc {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
         unsafe { out.write(resource(this).desc) };
     }
+    out
 }
 /// Device method `GetCustomHeapProperties`, returning its struct through a
 /// hidden first argument: what a standard heap type is as a custom heap.
@@ -4489,6 +4551,14 @@ float4 lit() : SV_Target { return 1.0; }
             &mut committed,
         );
         assert_eq!(hr, S_OK);
+        let mut back = std::mem::MaybeUninit::<ResourceDesc>::uninit();
+        type GetResourceDesc = extern "system" fn(This, *mut ResourceDesc) -> *mut ResourceDesc;
+        let get_desc = slot::<GetResourceDesc>(committed, 0x50);
+        assert_eq!(get_desc(committed, back.as_mut_ptr()), back.as_mut_ptr());
+        // SAFETY: written above.
+        let read = unsafe { back.assume_init() };
+        assert_eq!((read.dimension, read.width), (BUFFER, 256));
+        assert!(get_desc(committed, std::ptr::null_mut()).is_null());
         let mut data = std::ptr::null_mut();
         assert_eq!(
             slot::<Map>(committed, 0x40)(committed, 0, null.cast(), &mut data),
@@ -4500,6 +4570,13 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(slot::<Release>(committed, 0x10)(committed), 0);
 
         let heap = heap(4 * KIB_64);
+        let mut heap_back = std::mem::MaybeUninit::<HeapDesc>::uninit();
+        type GetHeapDesc = extern "system" fn(This, *mut HeapDesc) -> *mut HeapDesc;
+        let get_heap_desc = slot::<GetHeapDesc>(heap, 0x40);
+        assert_eq!(get_heap_desc(heap, heap_back.as_mut_ptr()), heap_back.as_mut_ptr());
+        // SAFETY: written above.
+        assert_eq!(unsafe { heap_back.assume_init() }.size, 4 * KIB_64);
+        assert!(get_heap_desc(heap, std::ptr::null_mut()).is_null());
         let place = |offset, desc: &ResourceDesc, out: &mut This| {
             create_placed(
                 null,
