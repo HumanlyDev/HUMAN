@@ -2311,11 +2311,15 @@ const METHODS: [(usize, *const ()); 52] = [
     (124, ignored_state as *const ()),            // 0x3e0 shading rate
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
+/// `DiscardResource(resource, region)`: hint that previous contents are not needed.
+extern "system" fn discard_resource(_: This, _: This, _: *const ()) {}
+
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 9] = [
+const MORE_METHODS: [(usize, *const ()); 10] = [
     (28, query_mark as *const ()),             // 0xe0 BeginQuery
     (29, query_mark as *const ()),             // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
+    (53, discard_resource as *const ()),       // 0x1a8 DiscardResource
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310
     (99, driver_hint as *const ()),            // 0x318
