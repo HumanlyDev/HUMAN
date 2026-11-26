@@ -2389,6 +2389,64 @@ pub(crate) fn is_resource(this: This) -> bool {
         && usize::from_ne_bytes(table) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
 }
 
+/// Resolves a resource passed to `PresentX` to a live rendered/written title
+/// texture at the same console GPU address when `this` itself has no rendered
+/// host texture (for example, a display-plane alias placed over a render target).
+#[cfg(windows)]
+pub(crate) fn present_target(this: This) -> This {
+    if this.is_null() {
+        return this;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return this;
+    }
+    let has_written_host = !fills(&r.desc)
+        && r.host
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+    if has_written_host {
+        return this;
+    }
+    let at = r.data() as usize;
+    if at == 0 {
+        return this;
+    }
+    const DEPTH: u32 = 0x2;
+    let same_shape = |o: &ResourceDesc| {
+        !fills(o)
+            && o.flags & DEPTH == 0
+            && o.dimension == r.desc.dimension
+            && o.width == r.desc.width
+            && o.height == r.desc.height
+            && o.mip_levels == r.desc.mip_levels
+            && o.depth_or_array_size == r.desc.depth_or_array_size
+            && o.sample_count == r.desc.sample_count
+            && element(o.format).is_some_and(|e| Some(e) == element(r.desc.format))
+    };
+    let live = textures();
+    for &candidate in live.iter() {
+        if candidate == this as usize {
+            continue;
+        }
+        let other = resource(candidate as This);
+        if other.data() as usize == at
+            && same_shape(&other.desc)
+            && other
+                .host
+                .made
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+        {
+            return candidate as This;
+        }
+    }
+    this
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
