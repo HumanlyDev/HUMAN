@@ -636,10 +636,7 @@ impl HostPipeline {
             };
             tracing::info!(?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
-            let is_bake_shader = bound.iter().any(|s| {
-                let h = s.shader.hash.as_str();
-                crate::draw::BAKE_PIXEL_SHADERS.contains(&h) || crate::draw::BAKE_GEOMETRY_SHADERS.contains(&h)
-            });
+            let is_bake_shader = bound.iter().any(|s| s.shader.is_bake());
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
@@ -694,10 +691,7 @@ impl HostPipeline {
             };
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
-            let is_bake_shader = bound.iter().any(|s| {
-                let h = s.shader.hash.as_str();
-                crate::draw::BAKE_PIXEL_SHADERS.contains(&h) || crate::draw::BAKE_GEOMETRY_SHADERS.contains(&h)
-            });
+            let is_bake_shader = bound.iter().any(|s| s.shader.is_bake());
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
@@ -815,10 +809,7 @@ impl HostPipeline {
             cull = g.rasterizer.CullMode.0,
             "host graphics state"
         );
-        let is_bake_shader = bound.iter().any(|s| {
-            let h = s.shader.hash.as_str();
-            crate::draw::BAKE_PIXEL_SHADERS.contains(&h) || crate::draw::BAKE_GEOMETRY_SHADERS.contains(&h)
-        });
+        let is_bake_shader = bound.iter().any(|s| s.shader.is_bake());
         Some(HostPipeline {
             compute: false,
             mesh: false,
