@@ -3234,19 +3234,23 @@ impl State {
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
         };
-        let image = entry(ResourceType::Uav, at);
-        let depth = match role {
-            Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
-        };
-        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
+        let Some((of, image)) = entry(ResourceType::Uav, at) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
+        };
+        let (depth, depth_size) = if role == Role::Resolve {
+            let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
+                once!(?role, "no stand-in for the indirect light: other tables");
+                return false;
+            };
+            (Some(depth), [seen.Width as u32, seen.Height])
+        } else {
+            (None, [of.Width as u32, of.Height])
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = if role == Role::Resolve { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if of.Format.0 != format || seen.Width == 0 || seen.Height == 0 || volume != (role == Role::Air) {
+        if of.Format.0 != format || depth_size[0] == 0 || depth_size[1] == 0 || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
             return false;
         }
@@ -3254,7 +3258,7 @@ impl State {
             image,
             depth,
             size: [of.Width as u32, of.Height],
-            depth_size: [seen.Width as u32, seen.Height],
+            depth_size,
             slices: u32::from(of.DepthOrArraySize),
         })
     }
