@@ -61,9 +61,14 @@ pub(crate) extern "system" fn create(
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
 
+fn valid_event(event: *mut c_void) -> Option<usize> {
+    let raw = event as usize;
+    (!event.is_null() && raw != usize::MAX).then_some(raw)
+}
+
 fn set_event(event: usize) {
     #[cfg(windows)]
-    // SAFETY: the title passed an event handle.
+    // SAFETY: the title passed a valid non-null event handle.
     unsafe {
         windows_sys::Win32::System::Threading::SetEvent(event as *mut c_void)
     };
@@ -95,10 +100,14 @@ extern "system" fn completed_called(this: This) -> u64 {
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+    let valid = valid_event(event);
     if fence.value.load(Ordering::Acquire) >= value {
-        if !event.is_null() {
-            set_event(event as usize);
+        if let Some(handle) = valid {
+            set_event(handle);
         }
+        return S_OK;
+    }
+    if !event.is_null() && valid.is_none() {
         return S_OK;
     }
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -135,6 +144,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
                         ms.max(1),
                     );
                 }
+                crate::queue::before_sync();
+                crate::host::settle_for_fence();
                 crate::queue::release_held(false);
             }
             if fence.value.load(Ordering::Acquire) >= value {
@@ -148,7 +159,11 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         tracing::warn!(value, "blocking fence wait not implemented");
         return E_NOTIMPL;
     }
-    waiters.push((value, event as usize));
+    if let Some(handle) = valid
+        && !waiters.contains(&(value, handle))
+    {
+        waiters.push((value, handle));
+    }
     S_OK
 }
 /// Moves the fence to `value` and sets the events that waited for it.
@@ -273,5 +288,37 @@ mod tests {
         assert_eq!(slot::<Flags>(queried, 0x58)(queried), 0x2);
         assert_eq!(slot::<Release>(queried, 0x10)(queried), 1);
         assert_eq!(slot::<Release>(f, 0x10)(f), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn duplicate_waiters_and_invalid_handles_are_tolerated() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
+        let signal = slot::<extern "system" fn(This, u64) -> HRESULT>(f, 0x50);
+
+        // INVALID_HANDLE_VALUE must not be queued or passed to SetEvent.
+        assert_eq!(wait(f, 1, INVALID_HANDLE_VALUE), S_OK);
+        assert_eq!(wait(f, 10, INVALID_HANDLE_VALUE), S_OK);
+        assert!(fence(f).waiters.lock().unwrap().is_empty());
+
+        // SAFETY: plain auto-reset event.
+        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        assert!(!event.is_null());
+        for _ in 0..8 {
+            assert_eq!(wait(f, 10, event), S_OK);
+        }
+        assert_eq!(fence(f).waiters.lock().unwrap().len(), 1);
+        assert_eq!(signal(f, 10), S_OK);
+        // SAFETY: valid event handle.
+        assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
+        assert!(fence(f).waiters.lock().unwrap().is_empty());
+        // SAFETY: ours.
+        unsafe { CloseHandle(event) };
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 }
