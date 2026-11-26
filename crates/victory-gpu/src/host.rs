@@ -505,6 +505,36 @@ fn bury_lag() -> u64 {
 /// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
 /// numbers come in order, but for threads that overtake each other: one of
 /// those is dropped a little later than it could be.
+///
+/// Releasing thousands of retired `ID3D12Resource` COM handles on the hot
+/// submitting/relay thread can stall a frame by tens of milliseconds; by
+/// default (`VICTORY_BURY_THREAD=0` restores inline dropping), completed
+/// batches are handed off to a dedicated background reaper thread (`victory-gpu-bury`).
+fn bury_thread_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BURY_THREAD").is_none_or(|v| v != "0"))
+}
+
+fn bury_sender() -> Option<&'static std::sync::mpsc::SyncSender<Vec<(u64, Retired)>>> {
+    if !bury_thread_enabled() {
+        return None;
+    }
+    static TX: OnceLock<Option<std::sync::mpsc::SyncSender<Vec<(u64, Retired)>>>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<(u64, Retired)>>(64);
+        std::thread::Builder::new()
+            .name("victory-gpu-bury".into())
+            .spawn(move || {
+                while let Ok(batch) = rx.recv() {
+                    drop(batch);
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    })
+    .as_ref()
+}
+
 fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
     let done: Vec<(u64, Retired)> = {
@@ -515,7 +545,17 @@ fn bury(finished: u64) {
         }
         retired.drain(..n).collect()
     };
-    drop(done);
+    if let Some(tx) = bury_sender() {
+        if let Err(
+            std::sync::mpsc::TrySendError::Full(batch)
+            | std::sync::mpsc::TrySendError::Disconnected(batch),
+        ) = tx.try_send(done)
+        {
+            drop(batch);
+        }
+    } else {
+        drop(done);
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -10706,6 +10746,37 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn bury_offloads_retired_drops_to_background_thread() {
+        struct DropTracker {
+            caller: std::thread::ThreadId,
+            tx: std::sync::mpsc::Sender<(std::thread::ThreadId, Option<String>)>,
+        }
+        impl Drop for DropTracker {
+            fn drop(&mut self) {
+                let current = std::thread::current();
+                let _ = self.tx.send((current.id(), current.name().map(str::to_owned)));
+            }
+        }
+
+        let Some(sender) = super::bury_sender() else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let caller = std::thread::current().id();
+        sender
+            .send(vec![(
+                0,
+                super::Retired::Any(Box::new(DropTracker { caller, tx })),
+            )])
+            .expect("send to bury reaper");
+        let (dropped_tid, dropped_name) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reaper did not drop retired batch in time");
+        assert_ne!(dropped_tid, caller, "expected drop off caller thread");
+        assert_eq!(dropped_name.as_deref(), Some("victory-gpu-bury"));
     }
 }
 
