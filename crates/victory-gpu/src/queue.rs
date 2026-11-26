@@ -965,7 +965,7 @@ extern "system" fn present(
     #[cfg(windows)]
     if behind::on() && !this.is_null() {
         const COPY_SOURCE: u32 = 0x800;
-        let base_res = if planes > 0
+        let raw_base = if planes > 0
             // SAFETY: the title passes `planes` plane descriptions.
             && let Some(plane) = unsafe { plane_parameters.as_ref() }
             && plane.count > 0
@@ -976,6 +976,7 @@ extern "system" fn present(
         } else {
             None
         };
+        let base_res = raw_base.map(crate::resource::present_target);
         let take_copy = |resource: This| {
             crate::resource::host_copy(resource).map(|copy| {
                 let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
@@ -990,7 +991,8 @@ extern "system" fn present(
         let mut overlay = (planes > 1 && !plane_parameters.is_null())
             .then(|| overlay_resource(plane_parameters))
             .flatten()
-            .filter(|&over_res| base_res != Some(over_res))
+            .filter(|&over_res| raw_base != Some(over_res))
+            .map(crate::resource::present_target)
             .and_then(take_copy);
         if texture.is_none() {
             texture = overlay.take();
@@ -1014,14 +1016,16 @@ extern "system" fn present(
     {
         const COPY_SOURCE: u32 = 0x800;
         // SAFETY: the title passes `planes` plane descriptions.
-        let base_res = unsafe { plane_parameters.as_ref() }
+        let raw_base = unsafe { plane_parameters.as_ref() }
             .filter(|plane| plane.count > 0 && !plane.resources.is_null())
             // SAFETY: the plane lists `count` resources.
             .map(|plane| unsafe { *plane.resources });
+        let base_res = raw_base.map(crate::resource::present_target);
         let over_res = (planes > 1)
             .then(|| overlay_resource(plane_parameters))
             .flatten()
-            .filter(|&over_res| base_res != Some(over_res));
+            .filter(|&over_res| raw_base != Some(over_res))
+            .map(crate::resource::present_target);
         let base = base_res.and_then(|res| crate::resource::host_resource(res).map(|tex| (res, tex)));
         let over = over_res.and_then(|res| crate::resource::host_resource(res).map(|tex| (res, tex)));
         let (primary, secondary) = match (base, over) {
@@ -1385,8 +1389,6 @@ mod tests {
         });
         assert_ne!(resources[0], resources[1]);
         let primary = crate::resource::host_copy(resources[0]).unwrap();
-        let alias = crate::resource::host_copy(resources[1]).unwrap();
-        assert!(std::sync::Arc::ptr_eq(&primary, &alias));
         let list = host.new_list().unwrap();
         crate::list::ensure_state(&list, resources[0], TARGET);
         // SAFETY: the texture is a live render target, on an open list.
@@ -1400,6 +1402,7 @@ mod tests {
         list.close();
         host.execute(&[&list]);
         assert_eq!(primary.state.load(Ordering::Relaxed), TARGET);
+        assert_eq!(crate::resource::present_target(resources[1]), resources[0]);
 
         let planes = resources.each_ref().map(|resource| RetailPlane {
             prefix: Plane {
@@ -1446,7 +1449,8 @@ mod tests {
         for resource in resources {
             assert_eq!(release(resource), 0);
         }
-        drop((list, primary, alias));
+        assert!(crate::resource::made_copy(resources[1]).is_none());
+        drop((list, primary));
         crate::title_memory_freed(address as usize, 64 << 10);
         // SAFETY: freeing our own allocation after releasing the resources.
         assert_ne!(unsafe { VirtualFree(address, 0, MEM_RELEASE) }, 0);
