@@ -721,7 +721,7 @@ fn box32_straddle_fast_and_slow_paths_and_fast_bvh_validate_and_hit_on_card() {
     let want = bvh::intersect(&node, 5, &ray, true);
     assert_eq!(want, [0x20c, 0x400, 0x105, bvh::NONE]);
 
-    // Place one node strictly inside the 64 KiB page (0xFF80) and one straddling
+    // Place one node strictly inside the 64 KiB page (0xFF00) and one straddling
     // the boundary into the next page (0xFFC0).
     let mut data = vec![0u8; 0x1_0100];
     let put_node = |buf: &mut [u8], off: usize| {
@@ -729,9 +729,9 @@ fn box32_straddle_fast_and_slow_paths_and_fast_bvh_validate_and_hit_on_card() {
             buf[off + idx * 4..off + idx * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
     };
-    put_node(&mut data, 0xFF80);
+    put_node(&mut data, 0xFF00);
     put_node(&mut data, 0xFFC0);
-    for (t, node_off) in [0xFF80u64, 0xFFC0u64].into_iter().enumerate() {
+    for (t, node_off) in [0xFF00u64, 0xFFC0u64].into_iter().enumerate() {
         let addr = base + node_off;
         let ptr = ((addr >> 6) << 3) | 5;
         let rec: [u32; 13] = [
@@ -785,7 +785,7 @@ fn box32_straddle_fast_and_slow_paths_and_fast_bvh_validate_and_hit_on_card() {
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}/{mode}: dispatch failed: {e}"));
-            assert_eq!(&out[0][0..4], &want, "{label}/{mode} non-straddle 0xFF80");
+            assert_eq!(&out[0][0..4], &want, "{label}/{mode} non-straddle 0xFF00");
             assert_eq!(&out[0][4..8], &want, "{label}/{mode} straddle 0xFFC0");
         }
         ran += 1;

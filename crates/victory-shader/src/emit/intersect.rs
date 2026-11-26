@@ -454,7 +454,7 @@ impl<'a> Lower<'a> {
             coords.push(phi);
         }
         // The inverse direction held finite ([`bvh::boxes`]).
-        let fast = super::fast_bvh();
+        let fast = crate::emit::fast_bvh();
         let (most, least) = if fast {
             (
                 self.s.m.f32(1e30_f32.to_bits()),
