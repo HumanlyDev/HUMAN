@@ -179,7 +179,7 @@ fn early_budgets() -> (u64, u64) {
         let ms = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
         };
-        (ms("VICTORY_EARLY_TEXTURES_MS", 12), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
+        (ms("VICTORY_EARLY_TEXTURES_MS", 32), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
     })
 }
 
@@ -2539,7 +2539,7 @@ impl State {
             None => {
                 let base = staging_budget_per_frame(memory.map(|[budget, ..]| budget));
                 if crate::residency::limited_host_ram() {
-                    base.min(128 << 20)
+                    base.min(256 << 20)
                 } else {
                     base
                 }
@@ -2728,7 +2728,7 @@ impl State {
                         View::Placed(false, _, desc) => crate::resource::first_mip(&desc),
                         _ => 0,
                     });
-                    tracing::warn!(
+                    tracing::debug!(
                         first_level = first,
                         blocks_shown_elsewhere = elsewhere.len(),
                         slot = index,
