@@ -62,6 +62,7 @@ manual_clamp = "allow"
 implicit_saturating_sub = "allow"
 min_max = "allow"
 precedence = "allow"
+missing_transmute_annotations = "allow"
 # Upstream warns on unsafe blocks without a SAFETY comment; eleven blocks in
 # this fork's newer GPU code still lack one.
 undocumented_unsafe_blocks = "allow"
