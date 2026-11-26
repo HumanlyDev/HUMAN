@@ -158,7 +158,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
+    let mut walls = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
+    walls.retain(|f| f.0 != file as usize);
+    walls.push((file as usize, kept));
+    drop(walls);
     put(out, file)
 }
 
@@ -282,6 +285,16 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     files: Files,
+}
+
+impl Drop for File {
+    fn drop(&mut self) {
+        let key = std::ptr::from_ref(self) as usize - std::mem::offset_of!(Instance<File>, state);
+        WALLS_FILES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|f| f.0 != key);
+    }
 }
 
 /// How files are read (`VICTORY_DSTORAGE_IO`).
@@ -757,7 +770,9 @@ pub(crate) mod stream_log {
             return;
         }
         let now = now();
-        let ago = |t: Option<std::time::Instant>| now - t.map_or(0, |t| t.elapsed().as_millis() as u64);
+        let ago = |t: Option<std::time::Instant>| {
+            now.saturating_sub(t.map_or(0, |t| t.elapsed().as_millis() as u64))
+        };
         let r = &job.request;
         line(format_args!(
             "R\t{}\t{}\t{:x}\t{}\t{}\t{}\t{:x}\t{}\t{}\t{}\t{now}\t{:x}",
@@ -875,7 +890,7 @@ impl Lanes {
     }
 
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
-        self.staged -= job.staging;
+        self.staged = self.staged.saturating_sub(job.staging);
         if let Some(lane) = self.lanes.get_mut(&job.lane) {
             lane.running.remove(&job.seq);
             if let Err(hr) = result {
@@ -1414,7 +1429,15 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
+        const MAX_INTERMEDIATE_SIZE: usize = 256 << 20;
+        let intermediate = request.intermediate_size as usize;
+        if intermediate == 0 {
+            return Err(fail(INVALID_DATA, "zero intermediate size for zlib+bcpack"));
+        }
+        if intermediate > MAX_INTERMEDIATE_SIZE {
+            return Err(fail(E_OUTOFMEMORY, "intermediate size exceeds limit"));
+        }
+        let mut packed = vec![0; intermediate];
         let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
         packed.truncate(n);
         Cow::Owned(packed)
@@ -2561,5 +2584,45 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn closed_files_unregister_from_walls_files_and_bad_intermediate_sizes_fail() {
+        let (_dir, file) = file_with(b"hello");
+        let addr = file as usize;
+        assert!(
+            WALLS_FILES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|f| f.0 == addr)
+        );
+        // Release the file object (slot 0x10 is IUnknown::Release).
+        let release_fn: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        assert_eq!(release_fn(file), 0);
+        assert!(
+            !WALLS_FILES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|f| f.0 == addr)
+        );
+
+        // Two-stage ZLIB | BCPACK with 0 or oversized intermediate_size fails cleanly.
+        with_test_tables();
+        let packed = compress_zlib(b"not bcpack");
+        let mut out = [0u8; 16];
+        let mut r = request(
+            ZLIB | (7 << 1) | MEMORY_SOURCE,
+            out.as_mut_ptr().cast(),
+            out.len(),
+            packed.as_ptr().cast(),
+            0,
+            packed.len(),
+        );
+        r.intermediate_size = 0;
+        assert_eq!(execute(&r), Err(INVALID_DATA));
+        r.intermediate_size = (512 << 20) as u32;
+        assert_eq!(execute(&r), Err(E_OUTOFMEMORY));
     }
 }

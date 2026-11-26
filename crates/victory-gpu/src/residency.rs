@@ -97,9 +97,9 @@ pub(crate) fn limited_host_ram() -> bool {
 
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
     if was {
-        physical < 5 * GIB || commit < 6 * GIB
+        physical < 2304 * MIB || commit < 4 * GIB
     } else {
-        physical <= 3 * GIB || commit <= 4 * GIB
+        physical <= 1536 * MIB || commit <= 3 * GIB
     }
 }
 
@@ -151,8 +151,10 @@ pub(crate) fn critical_commit() -> bool {
 pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited: bool, staging: u64) -> u64 {
     if critical {
         bytes.min(16 << 20)
-    } else if pressure || (limited && staging >= GIB) {
-        bytes.min(64 << 20)
+    } else if pressure {
+        bytes.min(96 << 20)
+    } else if limited && staging >= GIB {
+        bytes.min(192 << 20)
     } else {
         bytes
     }
@@ -179,22 +181,22 @@ mod tests {
 
     #[test]
     fn either_constraint_enters_pressure_and_both_must_recover() {
-        assert!(next_pressure(false, 12 * GIB, 4 * GIB));
-        assert!(next_pressure(false, 3 * GIB, 16 * GIB));
-        assert!(next_pressure(true, 4 * GIB, 7 * GIB));
-        assert!(next_pressure(true, 6 * GIB, 5 * GIB));
-        assert!(!next_pressure(true, 5 * GIB, 6 * GIB));
-        assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
+        assert!(next_pressure(false, 12 * GIB, 3 * GIB));
+        assert!(next_pressure(false, 1536 * MIB, 16 * GIB));
+        assert!(next_pressure(true, 2 * GIB, 7 * GIB));
+        assert!(next_pressure(true, 6 * GIB, 3584 * MIB));
+        assert!(!next_pressure(true, 2304 * MIB, 4 * GIB));
+        assert!(!next_pressure(false, 2 * GIB, 4 * GIB));
     }
 
     #[test]
     fn prefetch_respects_existing_budgets_and_resumes_after_recovery() {
-        assert_eq!(prefetch_limit(512 << 20, false, false, true, GIB), 64 << 20);
+        assert_eq!(prefetch_limit(512 << 20, false, false, true, GIB), 192 << 20);
         assert_eq!(prefetch_limit(512 << 20, false, false, true, GIB - 1), 512 << 20);
         assert_eq!(prefetch_limit(512 << 20, false, false, false, 2 * GIB), 512 << 20);
         assert_eq!(prefetch_limit(0, true, true, false, 0), 0);
         assert_eq!(prefetch_limit(8 << 20, true, true, false, 0), 8 << 20);
-        assert_eq!(prefetch_limit(512 << 20, true, false, false, 0), 64 << 20);
+        assert_eq!(prefetch_limit(512 << 20, true, false, false, 0), 96 << 20);
         assert_eq!(prefetch_limit(512 << 20, true, true, false, 0), 16 << 20);
         assert_eq!(prefetch_limit(192 << 20, false, false, false, 0), 192 << 20);
     }
