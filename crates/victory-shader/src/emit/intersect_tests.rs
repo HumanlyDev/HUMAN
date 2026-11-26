@@ -723,11 +723,10 @@ fn box32_straddle_fast_and_slow_paths_and_fast_bvh_validate_and_hit_on_card() {
 
     // Place one node strictly inside the 64 KiB page (0xFF00) and one straddling
     // the boundary into the next page (0xFFC0).
-    let mut data = vec![0u8; 0x1_0100];
-    let put_node = |buf: &mut [u8], off: usize| {
-        for (idx, word) in node.iter().enumerate() {
-            buf[off + idx * 4..off + idx * 4 + 4].copy_from_slice(&word.to_le_bytes());
-        }
+    let mut data = vec![0u32; 0x1_0100 / 4];
+    let put_node = |buf: &mut [u32], byte_off: usize| {
+        let word_off = byte_off / 4;
+        buf[word_off..word_off + node.len()].copy_from_slice(&node);
     };
     put_node(&mut data, 0xFF00);
     put_node(&mut data, 0xFFC0);
@@ -749,10 +748,8 @@ fn box32_straddle_fast_and_slow_paths_and_fast_bvh_validate_and_hit_on_card() {
             ray.inverse[2].to_bits(),
             1,
         ];
-        let at = t * RECORD as usize;
-        for (idx, word) in rec.iter().enumerate() {
-            data[at + idx * 4..at + idx * 4 + 4].copy_from_slice(&word.to_le_bytes());
-        }
+        let at = t * (RECORD as usize / 4);
+        data[at..at + rec.len()].copy_from_slice(&rec);
     }
 
     let _one = super::valu_tests::ONE_AT_A_TIME
