@@ -152,6 +152,23 @@ pub(crate) struct Translated {
     pub(crate) picks: std::sync::atomic::AtomicU8,
 }
 
+impl Shader {
+    /// Whether the raw shader container contains `needle` (used to match
+    /// embedded shader names across permutations).
+    pub(super) fn container_has(&self, needle: &[u8]) -> bool {
+        !needle.is_empty() && self.container.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Whether this shader is a ped texture compositor / decoration bake stage.
+    #[cfg(windows)]
+    pub(super) fn is_bake(&self) -> bool {
+        let h = self.hash.as_str();
+        crate::draw::BAKE_PIXEL_SHADERS.contains(&h)
+            || crate::draw::BAKE_GEOMETRY_SHADERS.contains(&h)
+            || self.container_has(b"BakeDecorations")
+    }
+}
+
 #[cfg(windows)]
 impl Shader {
     /// The translation, made on first use; a shader that does not

@@ -53,7 +53,7 @@ pub(crate) struct Pending {
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
     shaders
         .iter()
-        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+        .any(|s| s.stage == "compute" && s.container_has(name))
 }
 
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
@@ -87,9 +87,26 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     None
 }
 
-/// Confirmed first-scene producers. Prepare these at creation even on a cold
-/// launch so cutscene lighting, tiling, and bakes never miss their first frame.
+/// Confirmed first-scene producers (ped head blendshapes/stretch, neural
+/// facial compute-graph ops, ped skinning, visibility, tiling, and decoration
+/// bake pixel shaders). Prepare these at creation and prioritize them on the
+/// screen workers so character faces/heads and opening-scene lighting never
+/// miss their first frame behind cold world shaders.
 fn scene_input(shaders: &[Arc<Shader>]) -> bool {
+    const COMPUTE_PRODUCERS: [&[u8]; 12] = [
+        b"CS_ComputeBlendshapeMappings",
+        b"CS_BlendshapeTranslations",
+        b"CS_ReconstructBlendshapeNormals",
+        b"CS_ComputeStickyLips",
+        b"CS_ResetStretch",
+        b"CS_AccumStretch",
+        b"CS_FinalizeStretch",
+        b"CS_PedStandardSkinning_",
+        b"CS_PosOnlyLodSkinning",
+        b"CS_GenWorldAabbs",
+        b"Operation_",
+        b"Technique_",
+    ];
     shaders.iter().any(|s| {
         matches!(
             s.hash.as_str(),
@@ -100,6 +117,8 @@ fn scene_input(shaders: &[Arc<Shader>]) -> bool {
                 | "2cc4c197ee29e291"
                 | "369cbe906ea72764"
         ) || crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str())
+            || (s.stage == "compute"
+                && COMPUTE_PRODUCERS.iter().any(|name| s.container_has(name)))
     })
 }
 
@@ -118,9 +137,11 @@ impl Pending {
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         let scene_input = scene_input(&shaders);
+        let bake_mesh = shaders.iter().any(|s| s.container_has(b"BakeDecorations"));
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
-            || scene_input;
+            || scene_input
+            || bake_mesh;
         let left_out = left_out(&shaders);
         Pending {
             screen,
@@ -662,5 +683,40 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn ped_head_skinning_and_graph_compute_shaders_are_scene_inputs() {
+        for name in [
+            b"CS_ComputeBlendshapeMappings_54139280".as_slice(),
+            b"CS_PedStandardSkinning_0_15f19d85",
+            b"CS_PosOnlyLodSkinning_f1f31b8d",
+            b"CS_ResetStretch_8009c8e4",
+            b"CS_MatMulAlignedOperation_5ccdaacf",
+            b"CS_ReduceSumTechnique_da205a95",
+        ] {
+            let s = super::super::shader("compute", name);
+            let p = Pending::new(vec![s], None);
+            assert!(p.scene_input, "expected scene_input for {}", String::from_utf8_lossy(name));
+            assert!(p.screen, "expected screen priority for {}", String::from_utf8_lossy(name));
+        }
+
+        let world_cs = super::super::shader("compute", b"CS_SomeWorldPass");
+        let world_p = Pending::new(vec![world_cs], None);
+        assert!(!world_p.scene_input);
+        assert!(!world_p.screen);
+
+        let non_cs = super::super::shader("pixel", b"PS_Operation_Test");
+        let non_cs_p = Pending::new(vec![non_cs], None);
+        assert!(!non_cs_p.scene_input);
+    }
+
+    #[test]
+    fn bake_decorations_mesh_gets_screen_priority_and_is_bake() {
+        let bake_ms = super::super::shader("mesh", b"MSNC_VS_BakeDecorations_test");
+        assert!(bake_ms.is_bake());
+        let p = Pending::new(vec![bake_ms], None);
+        assert!(!p.scene_input);
+        assert!(p.screen);
     }
 }
