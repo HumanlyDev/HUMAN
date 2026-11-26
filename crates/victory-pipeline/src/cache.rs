@@ -13,11 +13,17 @@ pub struct CacheKey(blake3::Hash);
 
 impl CacheKey {
     pub fn new(converter: &dyn Converter, input: &[u8]) -> Self {
+        Self::from_parts(converter, &[input])
+    }
+
+    pub fn from_parts(converter: &dyn Converter, parts: &[&[u8]]) -> Self {
         let mut h = blake3::Hasher::new();
         h.update(converter.id().as_bytes());
         h.update(&[0]);
         h.update(&converter.version().to_le_bytes());
-        h.update(input);
+        for part in parts {
+            h.update(part);
+        }
         CacheKey(h.finalize())
     }
 
@@ -46,16 +52,28 @@ impl Cache {
         self.root.join(&hex[..2]).join(&hex[2..])
     }
 
-    /// Returns the cached output for `input`, converting it first if needed.
+    /// Returns the cached output path for `input`, converting it first if needed.
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
-        let key = CacheKey::new(converter, input);
+        self.get_or_convert_parts(converter, &[input], || converter.convert(input))
+            .map(|(path, _)| path)
+    }
+
+    /// Hashes `parts` without concatenating them into a temporary buffer, and
+    /// returns the cache path along with the freshly converted in-memory bytes
+    /// on a cache miss so callers need not re-read the file they just wrote.
+    pub fn get_or_convert_parts(
+        &self,
+        converter: &dyn Converter,
+        parts: &[&[u8]],
+        convert: impl FnOnce() -> Result<Vec<u8>>,
+    ) -> Result<(PathBuf, Option<Vec<u8>>)> {
+        let key = CacheKey::from_parts(converter, parts);
         let path = self.path_for(&key);
         if path.is_file() {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
-            return Ok(path);
+            return Ok((path, None));
         }
-        let output = converter
-            .convert(input)
+        let output = convert()
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
         let dir = path.parent().expect("hashed path has a parent");
         std::fs::create_dir_all(dir)?;
@@ -68,7 +86,7 @@ impl Cache {
             let _ = std::fs::remove_file(&tmp);
         }
         published?;
-        Ok(path)
+        Ok((path, Some(output)))
     }
 }
 
@@ -232,5 +250,31 @@ mod tests {
     fn refuses_cache_inside_repo() {
         let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("cache");
         assert!(Cache::open(inside).is_err());
+    }
+
+    #[test]
+    fn multi_part_key_and_in_memory_miss_match_concatenated_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let parts: [&[u8]; 2] = [b"build-fingerprint-", b"shader-container"];
+        let concat = parts.concat();
+        assert_eq!(
+            CacheKey::from_parts(&conv, &parts),
+            CacheKey::new(&conv, &concat)
+        );
+        let (path_miss, fresh) = cache
+            .get_or_convert_parts(&conv, &parts, || conv.convert(&concat))
+            .unwrap();
+        assert_eq!(fresh.as_deref(), Some(concat.to_ascii_uppercase().as_slice()));
+        let (path_hit, cached) = cache
+            .get_or_convert_parts(&conv, &parts, || conv.convert(&concat))
+            .unwrap();
+        assert_eq!(path_miss, path_hit);
+        assert!(cached.is_none());
+        assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
     }
 }

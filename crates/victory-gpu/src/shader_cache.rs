@@ -153,16 +153,24 @@ fn cached(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
     };
+    let parts = [&build[..], container];
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
+        let (path, fresh) = cache
+            .get_or_convert_parts(&converter, &parts, || {
+                converter.ran.store(true, Ordering::Relaxed);
+                let shader = (converter.translate)(container).map_err(anyhow::Error::msg)?;
+                Ok(encode(&shader))
+            })
             .map_err(|e| format!("{e:#}"))?;
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        let decoded = match fresh {
+            Some(bytes) => decode(&bytes),
+            None => std::fs::read(&path).ok().and_then(|b| decode(&b)),
+        };
+        if let Some(shader) = decoded {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
             } else {
@@ -215,9 +223,21 @@ fn root_type(code: u32) -> RootType {
     }
 }
 
+fn encoded_capacity(s: &HostShader) -> usize {
+    40 + s.dxil.len()
+        + s.user_data.len() * 16
+        + s.samplers.len() * 16
+        + s.static_samplers.len() * 40
+        + s.root_cbvs.len()
+        + s.root_srvs.len()
+        + s.root_uavs.len()
+        + s.root_indexed_views.len() * 20
+}
+
 /// Little-endian words and length-prefixed lists.
 fn encode(s: &HostShader) -> Vec<u8> {
-    let mut out = MAGIC.to_vec();
+    let mut out = Vec::with_capacity(encoded_capacity(s));
+    out.extend_from_slice(MAGIC);
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
     let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u32;
     word(&mut out, stage);
@@ -432,8 +452,10 @@ mod tests {
 
     #[test]
     fn entries_round_trip_and_reject_damage() {
-        let bytes = encode(&shader());
-        assert_eq!(decode(&bytes), Some(shader()));
+        let s = shader();
+        let bytes = encode(&s);
+        assert_eq!(bytes.len(), encoded_capacity(&s));
+        assert_eq!(decode(&bytes), Some(s));
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
