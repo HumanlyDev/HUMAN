@@ -9443,6 +9443,17 @@ impl Host {
         dedicated.or_else(|| self.video_memory().map(|v| v[0]).filter(|&b| b > 0))
     }
 
+    /// Whether this device runs on the DXGI software adapter (WARP).
+    pub(crate) fn is_software(&self) -> bool {
+        self.adapter.as_ref().is_some_and(|adapter| {
+            // SAFETY: plain query on a live adapter.
+            unsafe { adapter.GetDesc1() }.is_ok_and(|d| {
+                d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                    || (d.VendorId == 0x1414 && d.DeviceId == 0x8c)
+            })
+        })
+    }
+
     /// Logs [`Self::video_memory_groups`], with `when` it is said.
     pub(crate) fn log_video_memory(&self, when: &str) {
         let Some([own, shared]) = self.video_memory_groups() else {

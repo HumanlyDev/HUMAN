@@ -1288,6 +1288,10 @@ mod tests {
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the depth-bounds pipeline was compiled again instead of loaded from the library"
         );
+        if host.is_software() {
+            eprintln!("software adapter (WARP) skips depth-bounds-only draw culling; draw check skipped");
+            return;
+        }
 
         // Execute two draws against a depth buffer cleared to 0.5:
         // 1) bounds [0.6, 1.0] -> rejected (target stays 0)
