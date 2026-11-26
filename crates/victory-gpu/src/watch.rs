@@ -242,18 +242,6 @@ thread_local! {
     static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-const FOUND_KEEP_MAX: usize = 65_536;
-
-struct TrimUsizeVec<'a>(&'a mut Vec<usize>, usize);
-
-impl Drop for TrimUsizeVec<'_> {
-    fn drop(&mut self) {
-        if self.0.capacity() > self.1 {
-            *self.0 = Vec::new();
-        }
-    }
-}
-
 /// The pages of `[first, last)` the kernel says were written since it was
 /// last asked, in order, each once, with their written parts; `None` if the range is not write-watched
 /// memory of one reservation. The caller holds the range ([`Asking`]).
@@ -261,14 +249,9 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     FOUND.with(|found| {
-        let mut found_ref = found.borrow_mut();
-        let guard = TrimUsizeVec(&mut found_ref, FOUND_KEEP_MAX);
-        let found = &mut *guard.0;
+        let mut found = found.borrow_mut();
         let mut count = (last - first) * PAGE / KERNEL_PAGE;
         if found.len() < count {
-            if count > FOUND_KEEP_MAX && found.capacity() < count {
-                found.reserve_exact(count - found.len());
-            }
             found.resize(count, 0);
         }
         let mut granularity = 0;
@@ -4398,21 +4381,5 @@ mod many_askers_tests {
         BITS.clear(511);
         assert!(!BITS.all(300, 700) && BITS.all(300, 511) && BITS.all(512, 700));
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
-    }
-
-    #[test]
-    fn found_scratch_guard_trims_oversized_buffers() {
-        let mut buf = Vec::with_capacity(64);
-        {
-            let _guard = super::TrimUsizeVec(&mut buf, 128);
-        }
-        assert_eq!(buf.capacity(), 64);
-
-        {
-            let guard = super::TrimUsizeVec(&mut buf, 128);
-            guard.0.reserve_exact(512);
-            assert!(guard.0.capacity() >= 512);
-        }
-        assert_eq!(buf.capacity(), 0);
     }
 }

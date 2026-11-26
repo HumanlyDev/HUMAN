@@ -50,6 +50,12 @@ pub(crate) struct Pending {
     left_out: Option<&'static str>,
 }
 
+fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    shaders
+        .iter()
+        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+}
+
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if shaders.iter().any(|s| s.skip_rt_non_gi) {
         return Some("non-GI reflection/shadow ray trace skipped under VICTORY_RT_GI");
@@ -64,7 +70,7 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         // clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.
         std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0")
     });
-    if skip_rt && shaders.iter().any(|s| s.is_rt_resolve) {
+    if skip_rt && named(shaders, b"CS_RaytracingResolve") {
         return Some("shades ray-tracing hits without BVH, left out");
     }
     static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
@@ -75,7 +81,7 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         }
         std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
     });
-    if skip_activate && shaders.iter().any(|s| s.is_activate_rays) {
+    if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }
     None

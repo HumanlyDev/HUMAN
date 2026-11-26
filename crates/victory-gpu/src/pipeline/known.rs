@@ -38,7 +38,7 @@ const STAGES: [&str; 8] =
     ["vertex", "pixel", "domain", "hull", "geometry", "compute", "amplification", "mesh"];
 
 /// `VICTORY_PIPELINE_BOOK=1`: the pipelines the title creates are kept.
-pub(crate) fn on() -> bool {
+fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_BOOK").is_some_and(|v| v == "1"))
 }
@@ -101,17 +101,16 @@ pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graphic
     let mut entry = id.to_vec();
     entry.push(shaders.len() as u8);
     for s in shaders {
-        let hash = s.full_hash;
+        let hash = *blake3::hash(&s.container).as_bytes();
         let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u8;
         entry.push(stage);
         entry.extend(hash);
         if book.shaders.insert(hash) {
-            let container = s.container_bytes();
             let new = &mut book.new[0];
             new.push(stage);
             new.extend(hash);
-            new.extend((container.len() as u32).to_le_bytes());
-            new.extend(&container);
+            new.extend((s.container.len() as u32).to_le_bytes());
+            new.extend(&s.container);
         }
     }
     entry.push(u8::from(graphics.is_some()));

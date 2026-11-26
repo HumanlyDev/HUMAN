@@ -60,28 +60,13 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
-    /// Full 32-byte BLAKE3 digest of the console container.
-    pub(crate) full_hash: [u8; 32],
-    /// Byte length of the console container as provided by the title.
-    pub(crate) container_len: usize,
-    /// Raw console container bytes, reclaimed once translated unless kept for
-    /// [`known`] (`VICTORY_PIPELINE_BOOK=1`) or deferred to [`crate::picked`].
-    container: Mutex<Vec<u8>>,
+    container: Vec<u8>,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
     /// Non-GI reflection/shadow ray trace skipped under `VICTORY_RT_GI=1`.
     #[cfg(windows)]
     pub(crate) skip_rt_non_gi: bool,
-    /// Compute shader belongs to the ray-tracing structure builder.
-    #[cfg(windows)]
-    pub(crate) is_builder: bool,
-    /// Compute shader name contains `CS_RaytracingResolve`.
-    #[cfg(windows)]
-    pub(crate) is_rt_resolve: bool,
-    /// Compute shader name contains `CS_ScreenProbes_ActivateRays`.
-    #[cfg(windows)]
-    pub(crate) is_activate_rays: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -95,25 +80,9 @@ impl std::fmt::Debug for Shader {
 /// Every container seen, by full content hash.
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
-/// For the memory lines: containers seen and their bytes currently retained
-/// in RAM, translations kept and the bytes of their host code.
+/// For the memory lines: containers kept and their bytes, translations
+/// kept and the bytes of their host code. None of them is ever let go.
 static KEPT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
-
-#[cfg(windows)]
-fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
-}
-
-#[cfg(windows)]
-fn of_builder_bytes(bytes: &[u8]) -> bool {
-    use victory_shader::{Container, FourCC};
-    let Ok(c) = Container::parse(bytes) else {
-        return false;
-    };
-    c.part(FourCC::DXIL)
-        .and_then(|part| victory_shader::native_programs(part.data).ok())
-        .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
-}
 
 /// What the shader table and the pipeline library keep in memory:
 /// containers and their bytes, translations and their bytes, the bytes of
@@ -137,32 +106,21 @@ pub(crate) fn kept() -> [u64; 7] {
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
-    let full_hash = *full.as_bytes();
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
-        .entry(full_hash)
+        .entry(*full.as_bytes())
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            #[cfg(windows)]
-            let is_compute = stage == "compute";
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
-                full_hash,
-                container_len: bytes.len(),
-                container: Mutex::new(bytes.to_vec()),
+                container: bytes.to_vec(),
                 #[cfg(windows)]
-                ambient: is_compute.then(|| crate::ambient::role(bytes)).flatten(),
+                ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
-                skip_rt_non_gi: is_compute && rt_gi::skip_non_gi_trace(bytes),
-                #[cfg(windows)]
-                is_builder: is_compute && of_builder_bytes(bytes),
-                #[cfg(windows)]
-                is_rt_resolve: is_compute && bytes_contain(bytes, b"CS_RaytracingResolve"),
-                #[cfg(windows)]
-                is_activate_rays: is_compute && bytes_contain(bytes, b"CS_ScreenProbes_ActivateRays"),
+                skip_rt_non_gi: stage == "compute" && rt_gi::skip_non_gi_trace(bytes),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -188,23 +146,6 @@ pub(crate) struct Translated {
     pub(crate) picks: std::sync::atomic::AtomicU8,
 }
 
-impl Shader {
-    /// Copies the currently retained console container bytes.
-    pub(crate) fn container_bytes(&self) -> Vec<u8> {
-        self.container.lock().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-
-    /// Reclaims the raw console container bytes from host RAM once no further
-    /// translation or inspection needs them.
-    #[cfg(windows)]
-    pub(crate) fn release_container(&self) {
-        let freed = std::mem::take(&mut *self.container.lock().unwrap_or_else(|e| e.into_inner()));
-        if !freed.is_empty() {
-            KEPT[1].fetch_sub(freed.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-}
-
 #[cfg(windows)]
 impl Shader {
     /// The translation, made on first use; a shader that does not
@@ -212,31 +153,18 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let (done, freed) = {
-                    let mut container = self.container.lock().unwrap_or_else(|e| e.into_inner());
-                    let done = translate(&container);
-                    // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
-                    // translated (`.dxil`), by the hash crash reports name it with
-                    if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
-                        let dir = std::path::PathBuf::from(dir);
-                        let _ = std::fs::create_dir_all(&dir);
-                        let stem = format!("{}.{}", self.hash, self.stage);
-                        let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &*container);
-                        if let Ok(t) = &done {
-                            let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
-                        }
+                let done = translate(&self.container);
+                // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
+                // translated (`.dxil`), by the hash crash reports name it with
+                if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
+                    let dir = std::path::PathBuf::from(dir);
+                    let _ = std::fs::create_dir_all(&dir);
+                    let stem = format!("{}.{}", self.hash, self.stage);
+                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
+                    if let Ok(t) = &done {
+                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
                     }
-                    let freed = if !known::on() && !crate::picked::on() {
-                        std::mem::take(&mut *container)
-                    } else {
-                        Vec::new()
-                    };
-                    (done, freed)
-                };
-                if !freed.is_empty() {
-                    KEPT[1].fetch_sub(freed.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
-                drop(freed);
                 if let Ok(t) = &done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -267,11 +195,7 @@ impl Shader {
     /// The console programs of the container; `None` if they are not known.
     pub(crate) fn programs(&self) -> Option<Vec<victory_shader::NativeProgram>> {
         use victory_shader::{Container, FourCC};
-        let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
-        if container.is_empty() {
-            return None;
-        }
-        let c = Container::parse(&container).ok()?;
+        let c = Container::parse(&self.container).ok()?;
         let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
         victory_shader::native_programs(part.data).ok()
     }
@@ -361,7 +285,17 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
-    matches!(shaders, [shader] if shader.is_builder)
+    use victory_shader::{Container, FourCC};
+    let [shader] = shaders else { return false };
+    if shader.stage != "compute" {
+        return false;
+    }
+    let Ok(c) = Container::parse(&shader.container) else {
+        return false;
+    };
+    c.part(FourCC::DXIL)
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
 }
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
@@ -514,7 +448,7 @@ pub(crate) fn bound(this: This) {
     }
     let frame = crate::frame::current();
     for shader in &p.shaders {
-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container_len, hash = %shader.hash, "first bind");
+        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
     }
 }
 
@@ -888,30 +822,8 @@ mod tests {
         pipeline(p)
             .shaders
             .iter()
-            .map(|s| (s.stage, s.container_bytes()))
+            .map(|s| (s.stage, s.container.clone()))
             .collect()
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn shader_release_container_reclaims_bytes_idempotently() {
-        let payload = b"unique-test-container-for-release-v1";
-        let s = shader("pixel", payload);
-        assert_eq!(s.container_len, payload.len());
-        assert_eq!(s.full_hash, *blake3::hash(payload).as_bytes());
-        assert_eq!(s.container_bytes(), payload);
-
-        let before = KEPT[1].load(std::sync::atomic::Ordering::Relaxed);
-        assert!(before >= payload.len() as u64);
-        s.release_container();
-        let after = KEPT[1].load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(after, before - payload.len() as u64);
-        assert!(s.container_bytes().is_empty());
-        assert_eq!(s.container_len, payload.len());
-
-        // Second release must be a no-op and never underflow KEPT[1].
-        s.release_container();
-        assert_eq!(KEPT[1].load(std::sync::atomic::Ordering::Relaxed), after);
     }
 
     #[test]
