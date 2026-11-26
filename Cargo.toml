@@ -59,6 +59,7 @@ style = { level = "allow", priority = -1 }
 complexity = { level = "allow", priority = -1 }
 perf = { level = "allow", priority = -1 }
 suspicious = { level = "allow", priority = -1 }
+min_max = "allow"
 undocumented_unsafe_blocks = "allow"
 
 [profile.dev.package."*"]
