@@ -51,6 +51,21 @@ impl Tdr {
             _ => None,
         }
     }
+
+    /// Warns when recovery is active (`TdrLevel` default/2/3) but `TdrDelay` is
+    /// still at or near the 2-second Windows default, which can reset the GPU
+    /// during heavy RT GI or cold shader-compilation frames.
+    pub(crate) fn delay_warning(&self) -> Option<&'static str> {
+        if matches!(self.level, Some(0 | 1)) {
+            return None;
+        }
+        (self.delay.unwrap_or(2) < 10).then_some(
+            "TdrDelay is under 10 seconds (Windows default is 2s): heavy RT GI or cold \
+             pipeline compilation frames may trigger spurious DXGI_ERROR_DEVICE_HUNG \
+             resets; consider setting TdrDelay (and TdrDdiDelay) to 30 or 60 in \
+             HKLM\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
+        )
+    }
 }
 
 /// A DWORD value under [`KEY`]; `None` when it is missing or not a DWORD.
@@ -96,6 +111,9 @@ pub(crate) fn log() {
     if let Some(warning) = tdr.warning() {
         tracing::warn!("{warning}");
     }
+    if let Some(delay_warning) = tdr.delay_warning() {
+        tracing::warn!("{delay_warning}");
+    }
 }
 
 #[cfg(test)]
@@ -113,12 +131,48 @@ mod tests {
     fn off_and_bugcheck_warn() {
         assert!(level(Some(0)).warning().unwrap().contains("freezes"));
         assert!(level(Some(1)).warning().unwrap().contains("blue screen"));
+        assert_eq!(level(Some(0)).delay_warning(), None);
+        assert_eq!(level(Some(1)).delay_warning(), None);
     }
 
     #[test]
     fn recovery_and_the_default_do_not_warn() {
         for l in [None, Some(2), Some(3)] {
             assert_eq!(level(l).warning(), None, "TdrLevel {l:?}");
+        }
+    }
+
+    #[test]
+    fn short_or_default_delay_warns_under_recovery_levels() {
+        for l in [None, Some(2), Some(3)] {
+            assert!(
+                Tdr {
+                    level: l,
+                    delay: None,
+                    ddi_delay: None
+                }
+                .delay_warning()
+                .unwrap()
+                .contains("TdrDelay is under 10 seconds")
+            );
+            assert!(
+                Tdr {
+                    level: l,
+                    delay: Some(5),
+                    ddi_delay: None
+                }
+                .delay_warning()
+                .is_some()
+            );
+            assert_eq!(
+                Tdr {
+                    level: l,
+                    delay: Some(10),
+                    ddi_delay: None
+                }
+                .delay_warning(),
+                None
+            );
         }
     }
 
