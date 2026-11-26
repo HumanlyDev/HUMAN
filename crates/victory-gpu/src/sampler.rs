@@ -29,7 +29,7 @@ struct Fields {
 impl Fields {
     fn host(&self) -> D3D12_SAMPLER_DESC {
         let linear = |f: u32| u32::from(f == 1 || f == 3);
-        let aniso = self.mag >= 2 || self.min >= 2;
+        let aniso = self.mag == 3 || self.min == 3;
         // The console compares when the instruction says so, with the
         // sampler's function; the host needs a comparison sampler for that.
         // A sampler given a real test (less ... greater-or-equal) is one;
@@ -225,5 +225,23 @@ mod tests {
             ]
         );
         assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
+    }
+
+    #[test]
+    fn anisotropic_point_samplers_stay_point() {
+        let mut w = [0u32; 27];
+        w[1] = 2; // anisotropic point mag
+        w[2] = 2; // anisotropic point min
+        w[3] = 1; // point mip
+        w[13] = 8;
+        let d = console(&w);
+        assert_eq!(d.Filter.0, 0x00);
+        assert_eq!(d.MaxAnisotropy, 1);
+
+        w[1] = 3; // anisotropic bilinear mag
+        w[2] = 3; // anisotropic bilinear min
+        let d = console(&w);
+        assert_eq!(d.Filter.0, 0x55);
+        assert_eq!(d.MaxAnisotropy, 8);
     }
 }
