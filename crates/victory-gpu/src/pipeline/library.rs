@@ -267,11 +267,18 @@ struct Call(u32, u64);
 
 fn call(what: &'static str, name: &str) -> Call {
     let (thread, since) = (crate::host::thread_id(), crate::host::now_us());
-    let label = LABEL.with(|l| l.borrow().clone());
+    let described = LABEL.with(|l| {
+        let label = l.borrow();
+        if label.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{name} {label}")
+        }
+    });
     CALLS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((thread, what, format!("{name} {label}"), since));
+        .push((thread, what, described, since));
     Call(thread, since)
 }
 
@@ -617,7 +624,7 @@ pub(crate) fn save(now: bool) {
     };
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
-    let used: Vec<String> = used().iter().flatten().cloned().collect();
+    let used: Vec<String> = used_read().iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -633,7 +640,7 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
-    let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
+    let slow: Vec<String> = slow_read().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
     let written = library_written
         .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
@@ -703,27 +710,39 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 const SLOW_FILE: &str = "slow-pipelines.txt";
 /// A pipeline that takes this long is one ([`slow`]).
 pub(crate) const SLOW_MS: u64 = 1000;
-static SLOW: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(None);
+static SLOW: RwLock<Option<std::collections::HashMap<String, u64>>> = RwLock::new(None);
 
-fn slow_ones() -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<String, u64>>> {
-    let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
-    if slow.is_none() {
-        let listed = DIR.get().and_then(|d| std::fs::read_to_string(d.join(SLOW_FILE)).ok()).unwrap_or_default();
-        *slow = Some(
-            listed
-                .lines()
-                .filter_map(|l| l.split_once(' '))
-                .filter_map(|(key, ms)| Some((key.to_owned(), ms.parse().ok()?)))
-                .collect(),
-        );
+fn init_slow() -> std::collections::HashMap<String, u64> {
+    let listed = DIR
+        .get()
+        .and_then(|d| std::fs::read_to_string(d.join(SLOW_FILE)).ok())
+        .unwrap_or_default();
+    listed
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter_map(|(key, ms)| Some((key.to_owned(), ms.parse().ok()?)))
+        .collect()
+}
+
+fn slow_read() -> std::sync::RwLockReadGuard<'static, Option<std::collections::HashMap<String, u64>>> {
+    {
+        let guard = SLOW.read().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return guard;
+        }
     }
-    slow
+    let mut guard = SLOW.write().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(init_slow());
+    }
+    drop(guard);
+    SLOW.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Whether making the title pipeline with `key` took [`SLOW_MS`] in this or
 /// an earlier run.
 pub(crate) fn slow(key: &str) -> bool {
-    slow_ones().as_ref().is_some_and(|s| s.contains_key(key))
+    slow_read().as_ref().is_some_and(|s| s.contains_key(key))
 }
 
 /// The title pipeline with `key` took `ms` to make.
@@ -731,8 +750,9 @@ pub(crate) fn note_time(key: &str, ms: u64) {
     if ms < SLOW_MS {
         return;
     }
-    let mut slow = slow_ones();
-    let known = slow.get_or_insert_default().entry(key.to_owned()).or_insert(0);
+    let mut slow = SLOW.write().unwrap_or_else(|e| e.into_inner());
+    let map = slow.get_or_insert_with(init_slow);
+    let known = map.entry(key.to_owned()).or_insert(0);
     if ms > *known {
         *known = ms;
         // With the next save of the early list.
@@ -741,21 +761,32 @@ pub(crate) fn note_time(key: &str, ms: u64) {
 }
 
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
-static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static USED: RwLock<Option<HashSet<String>>> = RwLock::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
-    let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
-    if used.is_none() {
-        let listed = DIR
-            .get()
-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
-            .unwrap_or_default();
-        let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        tracing::info!(pipelines = set.len(), "title pipelines to start early");
-        *used = Some(set);
+fn init_used() -> HashSet<String> {
+    let listed = DIR
+        .get()
+        .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
+        .unwrap_or_default();
+    let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
+    tracing::info!(pipelines = set.len(), "title pipelines to start early");
+    set
+}
+
+fn used_read() -> std::sync::RwLockReadGuard<'static, Option<HashSet<String>>> {
+    {
+        let guard = USED.read().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return guard;
+        }
     }
-    used
+    let mut guard = USED.write().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(init_used());
+    }
+    drop(guard);
+    USED.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
@@ -768,13 +799,16 @@ pub(crate) fn wanted_early(key: &str) -> bool {
     if *ALL.get_or_init(|| std::env::var_os("VICTORY_EARLY_ALL").is_some_and(|v| v == "1")) {
         return true;
     }
-    used().as_ref().is_some_and(|s| s.contains(key))
+    used_read().as_ref().is_some_and(|s| s.contains(key))
 }
 
 /// A draw or dispatch requested the title pipeline with `key`.
 pub(crate) fn note_used(key: &str) {
-    let mut used = used();
-    let set = used.get_or_insert_with(HashSet::new);
+    if used_read().as_ref().is_some_and(|s| s.contains(key) || s.len() >= EARLY_MAX) {
+        return;
+    }
+    let mut used = USED.write().unwrap_or_else(|e| e.into_inner());
+    let set = used.get_or_insert_with(init_used);
     if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }

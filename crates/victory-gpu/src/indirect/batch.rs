@@ -216,7 +216,13 @@ impl Table {
     pub(crate) unsafe fn new(at: *mut u8, base: u32, sources: [u64; SOURCES]) -> Table {
         // SAFETY: the caller's.
         unsafe { at.cast::<u32>().write_volatile(0) };
-        Table { at: at as usize, base, sources, ..Table::default() }
+        Table {
+            at: at as usize,
+            base,
+            sources,
+            times: Vec::with_capacity(32),
+            known: std::collections::HashMap::with_capacity(32),
+        }
     }
 
     /// The place in the scratch buffer of the record of `kind` at `offset`
@@ -283,8 +289,9 @@ pub(super) fn record(
         ]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
+        let fallback = sources[0];
         for (i, source) in sources.into_iter().enumerate() {
-            l.SetComputeRootShaderResourceView(i as u32, source);
+            l.SetComputeRootShaderResourceView(i as u32, if source != 0 { source } else { fallback });
         }
         l.SetComputeRootShaderResourceView(SOURCES as u32, jobs);
         l.SetComputeRootUnorderedAccessView(SOURCES as u32 + 1, dst.GetGPUVirtualAddress());
@@ -293,5 +300,35 @@ pub(super) fn record(
         // Nothing else the pass writes is read before the next full wait
         // (the budget, by the next pass): only the records have to be there.
         l.ResourceBarrier(&[after]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_preallocates_deduplicates_and_rolls_over_at_times_cap() {
+        let mut backing = vec![0u32; (TABLE as usize) / 4];
+        // SAFETY: `backing` is 4-byte aligned and holds `TABLE` bytes.
+        let mut table = unsafe { Table::new(backing.as_mut_ptr().cast(), 64, [11, 22, 0, 0]) };
+        assert!(table.times.capacity() >= 32);
+
+        // First placement allocates slot 0 at base 64.
+        assert_eq!(table.place(11, 128, 2), Some(64));
+        assert_eq!(backing[0], 1);
+        assert_eq!(backing[4], job(0, 2, 1));
+
+        // Up to TIMES (31) executions reuse the same slot and bump the count.
+        for count in 2..=TIMES {
+            assert_eq!(table.place(11, 128, 2), Some(64));
+            assert_eq!(backing[0], 1);
+            assert_eq!(backing[4], job(0, 2, count));
+        }
+
+        // The 32nd execution of the same record rolls over to a fresh job slot.
+        assert_eq!(table.place(11, 128, 2), Some(64 + u64::from(SLOT)));
+        assert_eq!(backing[0], 2);
+        assert_eq!(backing[8], job(0, 2, 1));
     }
 }
