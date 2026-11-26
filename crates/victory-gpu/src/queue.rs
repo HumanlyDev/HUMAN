@@ -1278,6 +1278,11 @@ const fn queue_table(newer: bool) -> [*const (); 36] {
         f[if newer { newer_slot(slot) } else { slot }] = method;
         i += 1;
     }
+    if newer {
+        // Xbox SuspendX (0xb8) and ResumeX (0xc0).
+        f[23] = object::ignore as *const ();
+        f[24] = object::ignore as *const ();
+    }
     f
 }
 

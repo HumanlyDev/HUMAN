@@ -218,10 +218,22 @@ struct Worker {
     allocator: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
+    event: windows::Win32::Foundation::HANDLE,
 }
 
 // SAFETY: a worker's objects are its thread's own; the queue is free-threaded.
 unsafe impl Send for Worker {}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        if !self.event.is_invalid() {
+            // SAFETY: our own event handle created in `Worker::new`.
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.event);
+            }
+        }
+    }
+}
 
 impl Worker {
     fn new(device: &ID3D12Device, queue: ID3D12CommandQueue) -> windows::core::Result<Worker> {
@@ -231,7 +243,14 @@ impl Worker {
             let list: ID3D12GraphicsCommandList =
                 device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
             list.Close()?;
-            Ok(Worker { queue, allocator, list, fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)? })
+            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
+            Ok(Worker {
+                queue,
+                allocator,
+                list,
+                fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
+                event,
+            })
         }
     }
 
@@ -275,8 +294,13 @@ impl Worker {
             self.list.Close()?;
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
             self.queue.Signal(&self.fence, value)?;
-            // (Without an event: this waits.)
-            self.fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;
+            if self.fence.GetCompletedValue() < value {
+                self.fence.SetEventOnCompletion(value, self.event)?;
+                windows::Win32::System::Threading::WaitForSingleObject(
+                    self.event,
+                    windows::Win32::System::Threading::INFINITE,
+                );
+            }
         }
         Ok(())
     }

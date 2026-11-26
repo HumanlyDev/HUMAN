@@ -13,6 +13,10 @@
 
 # Local configuration (contains paths to YOUR files)
 /victory.toml
+/launch-*.bat
+/launch-*.cmd
+/launch-*.ps1
+*.log
 
 # Places people tend to drop data into. Keep data outside the repo instead.
 /game/

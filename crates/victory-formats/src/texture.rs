@@ -712,6 +712,8 @@ impl Layout {
         // the same contiguous runs repeat on every row, including mip tails.
         let mut runs = Vec::new();
         if !linear {
+            let est_run_elems = (16 / n.max(1)).max(1);
+            runs.reserve((m.width as usize).div_ceil(est_run_elems));
             let mut first_linear = 0;
             let mut first_tiled = self.column(m, 0) as usize;
             for x in 1..m.width {
@@ -732,9 +734,21 @@ impl Layout {
             body.iter()
                 .all(|&(offset, _, len)| len == size && offset.is_multiple_of(size))
         });
+        let contiguous_linear_slice =
+            linear && row_pitch == bytes && m.pitch as usize * n == bytes;
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
+            if contiguous_linear_slice {
+                copy_run::<DETILE>(
+                    src,
+                    dst,
+                    base as usize,
+                    z as usize * depth_pitch,
+                    m.height as usize * bytes,
+                );
+                continue;
+            }
             for y in 0..m.height {
                 let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
                 if linear {
@@ -751,6 +765,9 @@ impl Layout {
                         }
                         Some(32) if tiled_row.is_multiple_of(32) => {
                             copy_runs::<32, DETILE>(src, dst, body, tiled_row, linear_row)
+                        }
+                        Some(64) if tiled_row.is_multiple_of(64) => {
+                            copy_runs::<64, DETILE>(src, dst, body, tiled_row, linear_row)
                         }
                         _ => copy_runs::<0, DETILE>(src, dst, body, tiled_row, linear_row),
                     }
@@ -1509,5 +1526,27 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn linear_contiguous_slices_round_trip_in_one_run() {
+        // 64 * 4 = 256 bytes per row (matches 256-byte linear pitch alignment).
+        let l = Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            depth: 3,
+            ..desc(64, 16, 1, 4, Swizzle::LINEAR)
+        })
+        .unwrap();
+        let row_pitch = 64 * 4;
+        let slice_pitch = row_pitch * 16;
+        let linear: Vec<u8> = (0..slice_pitch * 3).map(|i| (i * 19 + 3) as u8).collect();
+        let mut tiled = vec![0u8; l.size as usize];
+        let mut back = vec![0u8; linear.len()];
+        l.tile(&mut tiled, 0, 0, &linear, row_pitch, slice_pitch)
+            .unwrap();
+        assert_eq!(tiled, linear);
+        l.detile(&tiled, 0, 0, &mut back, row_pitch, slice_pitch)
+            .unwrap();
+        assert_eq!(back, linear);
     }
 }
