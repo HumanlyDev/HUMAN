@@ -443,6 +443,9 @@ fn sweep() {
     crate::residency::refresh();
     if crate::residency::pressured() {
         trim_spare_chunks();
+        crate::list::trim_idle();
+        crate::list::thin::trim_idle();
+        card_steps::trim_pool();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
@@ -543,7 +546,12 @@ fn bury(finished: u64) {
         if n == 0 {
             return;
         }
-        retired.drain(..n).collect()
+        let done: Vec<(u64, Retired)> = retired.drain(..n).collect();
+        if retired.capacity() > 4096 && retired.len() * 4 < retired.capacity() {
+            let keep = retired.len().max(1024);
+            retired.shrink_to(keep);
+        }
+        done
     };
     if let Some(tx) = bury_sender() {
         if let Err(
@@ -6392,6 +6400,21 @@ impl HostList {
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let keep = if crate::residency::pressured() { 0 } else { 2 };
+            let trimmed_batches: Vec<ID3D12Resource> = {
+                let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+                args.1 = 0;
+                if args.0.len() > keep {
+                    args.0.drain(keep..).collect()
+                } else {
+                    Vec::new()
+                }
+            };
+            for buffer in trimmed_batches {
+                retire_resource(buffer);
+            }
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);

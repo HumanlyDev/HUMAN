@@ -2781,8 +2781,14 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
+        // Release COM references pinned in dynamic slots before marking the
+        // slots reusable so dead textures/buffers are not held in VRAM until
+        // those exact indices are overwritten.
+        for slot in at as usize..end {
+            self.keep(self.count + slot as u32, None);
+        }
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
             let given = slots.iter().filter(|taken| **taken).count() as u32;
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
@@ -2854,6 +2860,26 @@ impl HostHeap {
             self.keep(index, made.kept.clone());
             Some(made.listed)
         })
+    }
+
+    /// Drops this thread's cached [`ListViews`] COM references when `recording`
+    /// finishes or resets, so idle threads do not pin up to 4096 resources.
+    pub(crate) fn clear_listed_views(recording: u64) {
+        if recording == 0 {
+            return;
+        }
+        LIST_VIEWS.with(|views| {
+            let mut views = views.borrow_mut();
+            if let Some(views) = views.as_mut()
+                && views.recording == recording
+            {
+                views.made.clear();
+                if views.made.capacity() > 1024 {
+                    views.made.shrink_to(256);
+                }
+                views.recording = 0;
+            }
+        });
     }
 
     /// As [`HostHeap::copy_to`], from the slot `from`, which the card does not

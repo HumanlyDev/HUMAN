@@ -326,6 +326,9 @@ const INPUT_INVALID: u32 = 4;
 struct Voice {
     decoder: Option<xma::Decoder>,
     pcm: VecDeque<i16>,
+    /// Reusable per-frame decode scratch buffers (avoids per-frame heap churn).
+    frame_scratch: Vec<u8>,
+    pcm_scratch: Vec<i16>,
     /// Samples per channel still to drop (start or loop subframe skips).
     skip: usize,
     ended: bool,
@@ -425,6 +428,8 @@ impl Xma {
         *slot = Some(Voice {
             decoder: None,
             pcm: VecDeque::new(),
+            frame_scratch: Vec::new(),
+            pcm_scratch: Vec::new(),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
             ended: false,
             trace: Trace {
@@ -603,7 +608,8 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     if at < 32 {
         at = 32 + xma::packet(data, 0).map_or(0, |p| p.first_frame_bit as usize);
     }
-    let Some(frame) = xma::read_frame(data, at) else {
+    let Some((frame_bits, frame_next)) = xma::read_frame_into(data, at, &mut voice.frame_scratch)
+    else {
         // This input is used up.
         context.set_field(0, 20 + current, 1, 0);
         return true;
@@ -612,30 +618,33 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
         xma::Decoder::new(channels, RATES[context.field(1, 27, 2) as usize])
     });
-    let mut pcm = Vec::with_capacity(xma::FRAME_SAMPLES * channels);
+    voice.pcm_scratch.clear();
+    let needed_pcm = xma::FRAME_SAMPLES * channels;
+    if voice.pcm_scratch.capacity() < needed_pcm {
+        voice.pcm_scratch.reserve(needed_pcm - voice.pcm_scratch.capacity());
+    }
     voice.trace.frames += 1;
-    if let Err(e) = decoder.decode(&frame.data, frame.bits, &mut pcm) {
+    if let Err(e) = decoder.decode(&voice.frame_scratch, frame_bits, &mut voice.pcm_scratch) {
         voice.trace.bad_frames += 1;
         if voice.trace.bad_frames <= 2 {
             tracing::debug!(
                 at,
-                bits = frame.bits,
-                head = ?&frame.data[..frame.data.len().min(8)],
+                bits = frame_bits,
+                head = ?&voice.frame_scratch[..voice.frame_scratch.len().min(8)],
                 %e,
                 "XMA frame did not decode"
             );
         }
     }
-    let mut next = frame.next.unwrap_or(0);
+    let mut next = frame_next.unwrap_or(0);
     let loops = context.field(0, 12, 8);
     let loop_end = context.field(4, 0, 26) as usize;
     let ends_loop = loop_end != 0
-        && (frame.start == loop_end
-            || (frame.start < loop_end && frame.next.is_none_or(|n| loop_end < n)));
+        && (at == loop_end || (at < loop_end && frame_next.is_none_or(|n| loop_end < n)));
     let looping = loops > 0 && ends_loop;
     if looping {
         let keep = (context.field(1, 12, 2) as usize + 1) * xma::SUBFRAME_SAMPLES * channels;
-        pcm.truncate(keep);
+        voice.pcm_scratch.truncate(keep);
         next = context.field(3, 0, 26) as usize;
         if loops != 255 {
             context.set_field(0, 12, 8, loops - 1);
@@ -643,9 +652,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     }
     // What is still to skip is this frame's (the stream's first, or a
     // loop's first when it is its last too).
-    let skip = (voice.skip * channels).min(pcm.len());
+    let skip = (voice.skip * channels).min(voice.pcm_scratch.len());
     voice.skip -= skip / channels;
-    voice.pcm.extend(&pcm[skip..]);
+    voice.pcm.extend(&voice.pcm_scratch[skip..]);
     if looping {
         // The loop's own skip is of its first frame, decoded next: not of
         // this one, its last.
@@ -1308,6 +1317,8 @@ mod tests {
         let mut voice = Voice {
             decoder: None,
             pcm: VecDeque::new(),
+            frame_scratch: Vec::new(),
+            pcm_scratch: Vec::new(),
             skip: 0,
             ended: false,
             trace: Trace {

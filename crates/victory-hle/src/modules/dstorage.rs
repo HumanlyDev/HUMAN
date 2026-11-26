@@ -149,16 +149,17 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
-    let kept = name.clone();
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
     if stream_log::on() {
-        stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
+        stream_log::line(format_args!("F\t{:x}\t{name}", file as usize));
     }
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
+    if walls_trace() != 0 {
+        WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, name));
+    }
     put(out, file)
 }
 
@@ -973,11 +974,17 @@ impl Lane {
 /// destination, memory sources need none (as on the console).
 fn staging_bytes(request: &Request) -> u64 {
     let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
-    if buffered && request.options & MEMORY_SOURCE == 0 {
+    let source = if buffered && request.options & MEMORY_SOURCE == 0 {
         u64::from(request.source_size)
     } else {
         0
-    }
+    };
+    let intermediate = if request.options & ZLIB != 0 && request.options & BCPACK != 0 {
+        u64::from(request.intermediate_size)
+    } else {
+        0
+    };
+    source.saturating_add(intermediate)
 }
 
 /// Ends a queue: what was not started is dropped, and this waits for the
@@ -1416,6 +1423,8 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
         let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
+        // Release the compressed source buffer before BCPack decode runs.
+        drop(source);
         packed.truncate(n);
         Cow::Owned(packed)
     } else {

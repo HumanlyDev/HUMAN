@@ -880,6 +880,8 @@ impl Shader {
 
         let bitcode = self.m.write();
         super::bitcode::census::note(&self.m, &bitcode);
+        // Free the IR module before allocating the DXIL part and container.
+        self.m = Module::default();
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
@@ -888,6 +890,7 @@ impl Shader {
         dxil.extend(16u32.to_le_bytes());
         dxil.extend((bitcode.len() as u32).to_le_bytes());
         dxil.extend(&bitcode);
+        drop(bitcode);
 
         let mut features = 0u64;
         if self.flags & flags::DOUBLES != 0 {

@@ -97,8 +97,8 @@ enum Key {
     Cmp(u8, V, V),
     Select(V, V, V),
     Extract(V, u32),
-    Call(u32, Vec<V>),
-    Gep(Ty, V, Vec<V>),
+    Call(u32, Box<[V]>),
+    Gep(Ty, V, [V; 2]),
     Load(V),
 }
 
@@ -183,9 +183,9 @@ fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
         }
         Op::Call(_, args) => args.iter_mut().for_each(|a| *a = f(*a)),
         Op::Phi(inc) => inc.iter_mut().for_each(|x| x.0 = f(x.0)),
-        Op::Gep(_, p, idx) => {
-            *p = f(*p);
-            idx.iter_mut().for_each(|i| *i = f(*i));
+        Op::Gep(gep) => {
+            gep.1 = f(gep.1);
+            gep.2.iter_mut().for_each(|i| *i = f(*i));
         }
     }
 }
@@ -707,7 +707,7 @@ impl Module {
                 // A constant table reads the same whatever is stored.
                 let base = match *p {
                     V::Inst(g) => match &self.insts[g as usize].op {
-                        Op::Gep(_, base, _) => *base,
+                        Op::Gep(gep) => gep.1,
                         _ => *p,
                     },
                     _ => *p,
@@ -744,7 +744,7 @@ impl Module {
             Op::Select(c, t, f) => Key::Select(*c, *t, *f),
             Op::Extract(a, n) => Key::Extract(*a, *n),
             Op::Call(f, args) => Key::Call(*f, args.clone()),
-            Op::Gep(ty, p, idx) => Key::Gep(*ty, *p, idx.clone()),
+            Op::Gep(gep) => Key::Gep(gep.0, gep.1, gep.2),
             Op::Load(p) => Key::Load(*p),
             _ => return None,
         })
@@ -801,19 +801,22 @@ impl Module {
         let mut known: HashMap<Key, V> = HashMap::new();
         // The reads of the block being walked since its last store.
         let mut read: HashMap<Key, V> = HashMap::new();
+        let mut joins: HashMap<Vec<(usize, V)>, V> = HashMap::new();
         let mut facts = Facts::default();
         let (yes, no) = (self.bool(true), self.bool(false));
         enum Step {
             Enter(usize),
-            Leave(Vec<Key>, Learned),
+            Leave(Vec<u32>, Learned),
         }
         let mut steps = vec![Step::Enter(0)];
         while let Some(step) = steps.pop() {
             let b = match step {
                 Step::Enter(b) => b,
-                Step::Leave(keys, learned) => {
-                    for k in keys {
-                        known.remove(&k);
+                Step::Leave(insts, learned) => {
+                    for i in insts {
+                        if let Some(k) = self.key(i) {
+                            known.remove(&k);
+                        }
                     }
                     for v in learned.bits {
                         facts.bits.remove(&v);
@@ -843,7 +846,7 @@ impl Module {
             read.clear();
             // Two joins of the same values from the same blocks are one.
             if passes & REUSE != 0 && self.blocks[b].phis.len() > 1 {
-                let mut joins: HashMap<Vec<(usize, V)>, V> = HashMap::new();
+                joins.clear();
                 for &p in &self.blocks[b].phis {
                     if repl[p as usize].is_some() {
                         continue;
@@ -904,8 +907,8 @@ impl Module {
                         changed = true;
                         continue;
                     }
-                    known.insert(key.clone(), V::Inst(i));
-                    added.push(key);
+                    known.insert(key, V::Inst(i));
+                    added.push(i);
                 }
                 // Reads of memory, and wave operations (the same lanes run
                 // the whole block): the block's own earlier one.
@@ -1047,6 +1050,13 @@ impl Module {
             } else {
                 blk.body.clear();
                 blk.phis.clear();
+            }
+        }
+        // Release heap operand vectors (`Call`, `Phi`, `Gep`) of dead
+        // instructions immediately instead of retaining them until `Module` drops.
+        for (inst, &is_live) in self.insts.iter_mut().zip(&live) {
+            if !is_live {
+                inst.op = Op::Load(V::Const(0));
             }
         }
         self.drop_unused_functions();
@@ -1344,7 +1354,7 @@ mod tests {
             .iter()
             .filter_map(|&i| match &m.insts[i as usize].op {
                 Op::Call(g, args) if m.funcs[*g as usize].name.contains("Store") => {
-                    Some(args.clone())
+                    Some(args.to_vec())
                 }
                 _ => None,
             })

@@ -504,6 +504,7 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        crate::descriptor::host::HostHeap::clear_listed_views(self.recording);
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
@@ -1038,6 +1039,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
 
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
+        crate::descriptor::host::HostHeap::clear_listed_views(self.recording);
         *self = State::default();
         self.pipeline = pipeline as usize;
     }

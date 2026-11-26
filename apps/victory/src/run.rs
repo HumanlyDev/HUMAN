@@ -54,7 +54,7 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let prepared = victory_loader::prepare_owned(original)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
@@ -64,13 +64,10 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
-    // The program is mapped from the copy `load` wrote: the file's bytes
-    // and their patched copy are not read again, and were held for the
-    // whole run (two blocks of 114.7 MB each for the title, in
-    // physical memory: run 65's memory map).
+    // The program is mapped from the copy `load` wrote: the patched bytes are
+    // not read again, so drop them immediately after mapping.
     let image_name = prepared.file_name();
     drop(prepared);
-    drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(

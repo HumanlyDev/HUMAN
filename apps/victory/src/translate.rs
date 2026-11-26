@@ -148,6 +148,7 @@ struct Checks {
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
+    pair_filters: Vec<String>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
 }
@@ -297,6 +298,10 @@ pub fn run(
                         };
                         let mut checks = Checks {
                             keep: (!pairs.is_empty()).then(|| kept.clone()),
+                            pair_filters: pairs
+                                .iter()
+                                .flat_map(|(v, p)| [v.clone(), p.clone()])
+                                .collect(),
                             validator: validate
                                 .then(|| Validator::load(dll.as_deref()).ok())
                                 .flatten(),
@@ -683,12 +688,18 @@ fn check(
     label: impl Fn() -> String,
 ) {
     if let Some(keep) = &checks.keep {
-        lock(keep).push((label(), shader.clone()));
+        let name = label();
+        if checks.pair_filters.iter().any(|f| name.contains(f)) {
+            lock(keep).push((name, shader.clone()));
+        }
     }
     // With `--list`: a hash of the module and of what the host binds for it,
     // to show which shaders a change to the translator touches.
     if t.list {
-        let hash = blake3::hash(format!("{shader:?}").as_bytes()).to_hex();
+        use std::io::Write as _;
+        let mut hasher = blake3::Hasher::new();
+        let _ = write!(hasher, "{shader:?}");
+        let hash = hasher.finalize().to_hex();
         t.lines.push(format!("{}  emitted {}", label(), &hash[..16]));
     }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.

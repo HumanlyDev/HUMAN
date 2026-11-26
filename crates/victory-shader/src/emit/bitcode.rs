@@ -151,11 +151,12 @@ enum Op {
     Cmp(u8, V, V),
     Select(V, V, V),
     Extract(V, u32),
-    Call(u32, Vec<V>),
+    Call(u32, Box<[V]>),
     /// Filled in later: (value, block).
     Phi(Vec<(V, usize)>),
-    /// `getelementptr` over the pointee type, from a pointer.
-    Gep(Ty, V, Vec<V>),
+    /// `getelementptr` over the pointee type, from a pointer (boxed to keep
+    /// `Op` compact across all instructions).
+    Gep(Box<(Ty, V, [V; 2])>),
     Load(V),
     /// Pointer, value.
     Store(V, V),
@@ -446,7 +447,7 @@ impl Module {
         let TypeDef::Func(ret, _) = self.types[self.funcs[i as usize].ty.0 as usize] else {
             unreachable!()
         };
-        self.push(block, ret, Op::Call(i, args))
+        self.push(block, ret, Op::Call(i, args.into_boxed_slice()))
     }
     /// A phi at the top of `block`; incoming values come with [`Module::set_phi`].
     pub fn phi(&mut self, block: usize, ty: Ty) -> V {
@@ -468,7 +469,7 @@ impl Module {
         };
         let ty = self.ptr_in(elem, space);
         let zero = self.i32(0);
-        self.push(block, ty, Op::Gep(arr, ptr, vec![zero, index]))
+        self.push(block, ty, Op::Gep(Box::new((arr, ptr, [zero, index]))))
     }
     pub fn load(&mut self, block: usize, ptr: V) -> V {
         let TypeDef::Ptr(ty, _) = self.types[self.type_of(ptr).0 as usize] else {
@@ -860,7 +861,8 @@ impl Module {
                         }
                         w.record(16, &r);
                     }
-                    Op::Gep(ty, p, idx) => {
+                    Op::Gep(gep) => {
+                        let (ty, p, idx) = &**gep;
                         r.clear();
                         r.extend([0, u64::from(ty.0), rel(*p)]);
                         r.extend(idx.iter().map(|&i| rel(i)));
@@ -921,9 +923,9 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
         }
         Op::Call(_, args) => args.iter().copied().for_each(f),
         Op::Phi(inc) => inc.iter().for_each(|x| f(x.0)),
-        Op::Gep(_, p, idx) => {
-            f(*p);
-            idx.iter().copied().for_each(f);
+        Op::Gep(gep) => {
+            f(gep.1);
+            gep.2.iter().copied().for_each(f);
         }
     }
 }
@@ -1039,7 +1041,11 @@ impl Writer {
 
     fn finish(mut self) -> Vec<u8> {
         self.align();
-        self.words.iter().flat_map(|w| w.to_le_bytes()).collect()
+        let mut out = Vec::with_capacity(self.words.len() * 4);
+        for w in &self.words {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out
     }
 }
 
@@ -1275,5 +1281,14 @@ mod tests {
                 fnv(&bytes)
             );
         }
+    }
+
+    #[test]
+    fn inst_layout_stays_compact() {
+        assert!(
+            std::mem::size_of::<Inst>() <= 40,
+            "Inst grew to {} bytes",
+            std::mem::size_of::<Inst>()
+        );
     }
 }

@@ -42,8 +42,14 @@ impl PreparedImage {
 ///   its base relocation is made a no-op so the 0 survives a rebase;
 /// * `FORCE_INTEGRITY` cleared, checksum zeroed: the copy is unsigned.
 pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
-    let info = ImageInfo::parse(original)?;
-    let mut bytes = original.to_vec();
+    prepare_owned(original.to_vec())
+}
+
+/// Like [`prepare`], but patches `bytes` in place instead of cloning the full
+/// PE image (halving peak startup RAM for 100–250 MiB title executables).
+pub fn prepare_owned(mut bytes: Vec<u8>) -> Result<PreparedImage, PrepareError> {
+    let original_hash = blake3::hash(&bytes);
+    let info = ImageInfo::parse(&bytes)?;
 
     let fh = layout::file_header_offset(&bytes).ok_or(PrepareError::Patch("no file header"))?;
     let opt =
@@ -99,26 +105,25 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         // does for DYNAMIC_BASE images), and the loader then reads callbacks
         // from there. Make that entry a no-op.
         let field_rva = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
-        for (entry, target) in dir64_relocations(&bytes, &info) {
-            if target == field_rva {
-                write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
-            }
+        for entry in find_dir64_relocations(&bytes, &info, field_rva) {
+            write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
         }
     }
 
     Ok(PreparedImage {
         info,
         bytes,
-        original_hash: blake3::hash(original),
+        original_hash,
     })
 }
 
 /// Size of an IMAGE_IMPORT_DESCRIPTOR in the PE file.
 const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
 
-/// Every `IMAGE_REL_BASED_DIR64` base relocation: (file offset of its entry,
-/// RVA it patches). Empty if the image has no readable relocation table.
-fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
+/// File offsets of `IMAGE_REL_BASED_DIR64` base relocations whose target RVA
+/// equals `target_rva`. Streams the relocation table without materialising
+/// hundreds of thousands of unrelated entries.
+fn find_dir64_relocations(bytes: &[u8], info: &ImageInfo, target_rva: u32) -> Vec<usize> {
     const DIR64: u16 = 10;
     let mut out = Vec::new();
     let Some(d) = layout::data_directory_offset(bytes, dir::BASERELOC) else {
@@ -142,13 +147,16 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
         if block < 8 || at + block > end {
             break;
         }
-        for entry in (at + 8..at + block).step_by(2) {
-            let Some(e) = bytes.get(entry..entry + 2) else {
-                break;
-            };
-            let e = u16::from_le_bytes([e[0], e[1]]);
-            if e >> 12 == DIR64 {
-                out.push((entry, page + u32::from(e & 0xFFF)));
+        if target_rva >= page && target_rva - page < 0x1000 {
+            let want = (target_rva - page) as u16;
+            for entry in (at + 8..at + block).step_by(2) {
+                let Some(e) = bytes.get(entry..entry + 2) else {
+                    break;
+                };
+                let e = u16::from_le_bytes([e[0], e[1]]);
+                if e >> 12 == DIR64 && (e & 0xFFF) == want {
+                    out.push(entry);
+                }
             }
         }
         at += block;
@@ -193,9 +201,7 @@ mod tests {
             assert_eq!(tls.callbacks_va, 0);
             let field = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
             assert!(
-                dir64_relocations(&prepared.bytes, &patched)
-                    .iter()
-                    .all(|&(_, target)| target != field),
+                find_dir64_relocations(&prepared.bytes, &patched, field).is_empty(),
                 "the cleared callback pointer must not be relocated"
             );
         }
@@ -279,5 +285,16 @@ mod tests {
         let a = prepare(&original).unwrap();
         let b = prepare(&original).unwrap();
         assert_eq!(a.file_name(), b.file_name());
+    }
+
+    #[test]
+    fn prepare_owned_matches_prepare_without_duplicating() {
+        let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let expected = prepare(&original).unwrap();
+        let ptr = original.as_ptr();
+        let owned = prepare_owned(original).unwrap();
+        assert_eq!(owned.bytes.as_ptr(), ptr, "patches the owned Vec in place");
+        assert_eq!(owned.original_hash, expected.original_hash);
+        assert_eq!(owned.bytes, expected.bytes);
     }
 }

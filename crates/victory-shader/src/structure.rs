@@ -128,6 +128,16 @@ impl Bools {
         }
     }
 
+    /// Drops build-only BDD hash tables (`unique`, `memo`, `ids`, `born`) once
+    /// construction is complete so downstream passes do not retain tens of MiB
+    /// of dead tables per shader.
+    fn seal(&mut self) {
+        self.unique = Map::default();
+        self.memo = Map::default();
+        self.ids = Map::default();
+        self.born = Vec::new();
+    }
+
     /// The atom tested at the top of `b` and the results when it is false
     /// and true; `None` for the constants.
     pub fn node(&self, b: Bool) -> Option<(Atom, Bool, Bool)> {
@@ -849,6 +859,10 @@ impl<'a> Lanes<'a> {
         }
         self.masks.retain(|k, _| !split.contains(&k.0));
         self.active.retain(|lo| !split.contains(lo));
+        // Drop BDD construction tables (`unique`, `memo`, `ids`, `born`) now
+        // that no further nodes will be created; downstream passes only read
+        // `nodes` and `atoms`.
+        self.b.seal();
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
@@ -1886,5 +1900,10 @@ mod tests {
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
         );
+        // Construction-only BDD tables are dropped before returning `Structured`.
+        assert_eq!(s.bools.unique.capacity(), 0);
+        assert_eq!(s.bools.memo.capacity(), 0);
+        assert_eq!(s.bools.ids.capacity(), 0);
+        assert_eq!(s.bools.born.capacity(), 0);
     }
 }

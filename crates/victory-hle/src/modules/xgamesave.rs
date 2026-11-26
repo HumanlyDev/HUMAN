@@ -564,7 +564,14 @@ const BLOB: usize = 24;
 /// Blobs laid out as the title reads them: the blob array, then each name
 /// (NUL-terminated) and its data, with pointers `base` plus offset.
 fn layout(blobs: &[(String, Vec<u8>)], base: usize) -> Vec<u8> {
-    let mut out = vec![0u8; blobs.len() * BLOB];
+    let header = blobs.len() * BLOB;
+    let total = header
+        + blobs
+            .iter()
+            .map(|(name, data)| name.len() + 1 + data.len())
+            .sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    out.resize(header, 0);
     for (i, (name, data)) in blobs.iter().enumerate() {
         let name_at = base + out.len();
         out.extend_from_slice(name.as_bytes());

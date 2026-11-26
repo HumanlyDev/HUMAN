@@ -624,6 +624,27 @@ pub(super) struct Taken {
     copied: Vec<(Arc<Shadow>, usize, usize)>,
 }
 
+/// Maximum idle card-step command lists (+ 4 MiB UAV buffers) kept in [`POOL`].
+const POOL_MAX: usize = 8;
+
+/// Drops excess idle card-step lists and their 4 MiB VRAM buffers under
+/// host memory pressure.
+pub(super) fn trim_pool() {
+    let keep = if crate::residency::critical_commit() { 0 } else { 2 };
+    let dropped: Vec<Own> = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.len() <= keep {
+            return;
+        }
+        let excess: Vec<Own> = pool.drain(keep..).collect();
+        if pool.capacity() > 16 {
+            pool.shrink_to(8);
+        }
+        excess
+    };
+    drop(dropped);
+}
+
 impl Taken {
     pub(super) fn list(&self) -> &HostList {
         &self.own.list
@@ -645,10 +666,18 @@ impl Taken {
 
     /// The submission has run and landed: the list and its buffer are free.
     pub(super) fn landed(self) {
-        // The host copies its steps held go; its commands stay until the
-        // next use resets it.
+        // Release host copies its steps held before parking or dropping.
         drop(std::mem::take(&mut *self.own.list.deferred()));
-        POOL.lock().unwrap_or_else(|e| e.into_inner()).push(self.own);
+        let limit = if crate::residency::pressured() { 2 } else { POOL_MAX };
+        let keep = {
+            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            if pool.len() < limit {
+                pool.push(self.own);
+                return;
+            }
+            self.own
+        };
+        drop(keep);
     }
 }
 
