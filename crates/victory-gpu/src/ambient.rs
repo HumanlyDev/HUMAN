@@ -218,8 +218,7 @@ void place(uint3 at : SV_DispatchThreadID) {
     float2 size = float2(width, height);
     float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(CX, CY)), size);
     float wz = min(p.z, 50.0);
-    float3 pc = p * (wz / max(p.z, 1e-6));
-    cells[CELLS + 1 + at.y * CX + at.x] = float4(pc, wz * wz);
+    cells[CELLS + 1 + at.y * CX + at.x] = float4(p, wz * wz);
 }
 #endif
 
@@ -465,7 +464,7 @@ pub(crate) struct Views {
     /// The image the title's program just wrote.
     pub(crate) image: D3D12_GPU_DESCRIPTOR_HANDLE,
     /// The scene's depth, for [`Role::Resolve`].
-    pub(crate) depth: Option<D3D12_GPU_DESCRIPTOR_HANDLE>,
+    pub(crate) depth: D3D12_GPU_DESCRIPTOR_HANDLE,
     /// The size of the image, the size of the depth texture, and how many slices it has.
     pub(crate) size: [u32; 2],
     pub(crate) depth_size: [u32; 2],
@@ -523,9 +522,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
         l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
-        if let Some(depth) = views.depth {
-            l.SetComputeRootDescriptorTable(1, depth);
-        }
+        l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
