@@ -6,7 +6,6 @@ if /i not "%mode%"=="pareto-residency" if /i not "%mode%"=="rt-gi" (
   echo Usage: Play-HUMAN.cmd [pareto-residency^|rt-gi] 1>&2
   exit /b 2
 )
-if not defined VICTORY_GAME_DIR set "VICTORY_GAME_DIR=%~dp0..\GTA6.Xbox.v1.0.2.1"
 if not exist "%VICTORY_GAME_DIR%\game_scarlett_master.exe" (
   echo Set VICTORY_GAME_DIR to your own dump folder containing game_scarlett_master.exe. 1>&2
   exit /b 2
