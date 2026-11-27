@@ -1319,7 +1319,7 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
+            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).is_taken(index - host.count);
             format!("dynamic slot {} (taken {taken:?})", index - host.count)
         };
         if twin {
@@ -1796,6 +1796,11 @@ impl DynamicSlots {
             cur += k;
         }
         given
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn is_taken(&self, slot: u32) -> Option<bool> {
+        (slot < self.len).then(|| (self.words[(slot / 64) as usize] >> (slot % 64)) & 1 != 0)
     }
 }
 
