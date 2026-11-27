@@ -62,6 +62,7 @@ fn build(words: &[u32], srv: (u8, u32)) -> Result<HostShader, ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        force_bvh_miss: false,
     })?;
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -367,5 +368,57 @@ fn a_tables_raw_buffer_is_read_at_its_raw_twin() {
     let views = [raw(&title), other(), other(), other(), raw(&twin), other(), View::RawUav(2)];
     for (label, got) in run(&shader, &views) {
         assert_eq!(got[..2], [0, 6], "{label}");
+    }
+}
+
+/// With `VICTORY_NAN_SCRUB` (on by default), `image_store` zeroes NaN and ±Inf
+/// while leaving finite values intact.
+#[test]
+fn nan_scrub_zeroes_nan_and_infinity_on_image_store() {
+    let words = [
+        0xF40C_0201u32, // s_load_dwordx8 s[8:15], s[2:3], 0
+        0xFA00_0000,
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E06_02FF, // v_mov_b32 v3, qNaN
+        0x7FC0_0000,
+        0x7E08_02FF, // v_mov_b32 v4, +Inf
+        0x7F80_0000,
+        0x7E0A_02FF, // v_mov_b32 v5, -Inf
+        0xFF80_0000,
+        0x7E0C_02FF, // v_mov_b32 v6, 1.5
+        1.5f32.to_bits(),
+        0xF020_1F08, // image_store v[3:6], v[0:1], s[8:15] dmask:0xf 2D
+        0x0002_0300,
+        0xBE84_0380, // s_mov_b32 s4, 0
+        0xBE85_0380, // s_mov_b32 s5, 0
+    ];
+    let program = [TABLE, &words, STORE].concat();
+    let texel = [[0.0; 4]; 1];
+    let views = [
+        View::TextureUav(1, 1),
+        View::Texture(1, 1, &texel),
+        View::RawUav(2),
+    ];
+
+    let was = lower::TEST_NAN_SCRUB.replace(Some(true));
+    let scrubbed = build(&program, (8, 0)).expect("translates with nan scrub");
+    lower::TEST_NAN_SCRUB.set(Some(false));
+    let unscrubbed = build(&program, (8, 0)).expect("translates without nan scrub");
+    lower::TEST_NAN_SCRUB.set(was);
+
+    assert_ne!(scrubbed.dxil, unscrubbed.dxil);
+    for (label, got) in run(&scrubbed, &views) {
+        assert_eq!(
+            got[..4],
+            [0, 0, 0, 1.5f32.to_bits()],
+            "{label}: NaN and +/-Inf should be scrubbed to 0"
+        );
+    }
+    for (label, got) in run(&unscrubbed, &views) {
+        assert!(f32::from_bits(got[0]).is_nan(), "{label}: expected NaN when scrub off");
+        assert_eq!(got[1], f32::INFINITY.to_bits(), "{label}");
+        assert_eq!(got[2], f32::NEG_INFINITY.to_bits(), "{label}");
+        assert_eq!(got[3], 1.5f32.to_bits(), "{label}");
     }
 }

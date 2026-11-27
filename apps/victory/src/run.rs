@@ -49,6 +49,19 @@ pub fn run(
 
     if execute {
         check_cpu_features()?;
+        // Without a live BVH builder, force BVH walks to miss at the root so
+        // unbuilt memory does not corrupt vegetation or route off-screen
+        // foreground water reflections to skipped resolve shaders.
+        let bvh_on = std::env::var("VICTORY_BVH_BUILDER")
+            .ok()
+            .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+            || std::env::var("VICTORY_RT_GI")
+                .ok()
+                .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"));
+        if !bvh_on && std::env::var_os("VICTORY_BVH_MISS").is_none() {
+            // SAFETY: single-threaded startup before spawning worker or title threads.
+            unsafe { std::env::set_var("VICTORY_BVH_MISS", "1") };
+        }
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();

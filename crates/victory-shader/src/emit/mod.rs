@@ -466,10 +466,17 @@ fn safe_rt_wide_candidate(c: &Container, native: &NativeProgram) -> bool {
     {
         return false;
     }
+    // The volumetric light's two tiled programs (`CS_TransmissionVolumetrics_Tiled`
+    // and `_Tiled_LocalLights`, GTA VI 1.0.2.1) and underwater pass
+    // (`CS_TransmissionVolumetricsSubmerged`) are groups of 64 with an LDS read and
+    // write in one lane-branch region; widened, they translate on 32-lane hosts.
     let scene_kernel = matches!(
         c.digest,
         [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
             | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
+            | [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
+            | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
+            | [0xf1, 0xf1, 0x61, 0xe4, 0x7e, 0xef, 0xa3, 0x64, 0x69, 0x18, 0x39, 0xfd, 0x72, 0x06, 0xcc, 0xf6]
     );
     if scene_kernel
         || crate::spill::is_spilled(native)
@@ -888,6 +895,56 @@ fn widen(
     }
 }
 
+/// Reflection / sky-visibility fallback passes that miss at the BVH root
+/// instead of walking rays so `CS_RayMiss` runs and shades off-screen
+/// foreground water reflections with the sky cubemap:
+/// - When `VICTORY_BVH_BUILDER` is off (unless `VICTORY_BVH_MISS=0`), any
+///   exempted fallback pass compiles with forced root miss so direct `victory`
+///   launches without `Play-HUMAN.cmd` still never read unbuilt BVH memory.
+/// - When `VICTORY_RT_GI=1` (without `VICTORY_RT_ALL` / `VICTORY_RT_REFLECTIONS`),
+///   non-GI reflection passes (`CS_RaytraceVBuffer`, `CS_Reflections_Raytrace`,
+///   `CS_GlossyReflections`) also force root miss.
+fn rt_gi_reflection_miss(c: &Container, native: &NativeProgram) -> bool {
+    if native.stage != HwStage::Cs {
+        return false;
+    }
+    let flag = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+    };
+    let has = |needle: &[u8]| {
+        c.parts
+            .iter()
+            .any(|part| part.data.windows(needle.len()).any(|w| w == needle))
+    };
+    if has(b"IrradianceCache")
+        || has(b"ScreenProbes")
+        || has(b"PrimaryProbes")
+        || has(b"RaytracingResolve")
+    {
+        return false;
+    }
+    let bvh_on = flag("VICTORY_BVH_BUILDER");
+    let explicit_no_miss = std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "0");
+    if !bvh_on
+        && !explicit_no_miss
+        && (has(b"CS_RaytraceVBuffer")
+            || has(b"CS_Reflections_Raytrace")
+            || has(b"CS_GlossyReflections")
+            || has(b"CS_SkyVisibility"))
+    {
+        return true;
+    }
+    let gi = flag("VICTORY_RT_GI");
+    let all = flag("VICTORY_RT_ALL");
+    let reflections = flag("VICTORY_RT_REFLECTIONS");
+    if !gi || all || reflections || has(b"SkyVisibility") {
+        return false;
+    }
+    has(b"CS_RaytraceVBuffer") || has(b"CS_Reflections_Raytrace") || has(b"CS_GlossyReflections")
+}
+
 /// The translated program, and the wave size it requires of the host.
 fn emit_program(
     c: &Container,
@@ -960,6 +1017,7 @@ fn emit_program(
         }
         _ => 0,
     };
+    let force_bvh_miss = rt_gi_reflection_miss(c, native);
     let l = lower::lower(&lower::Parts {
         native,
         p,
@@ -970,6 +1028,7 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
+        force_bvh_miss,
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {
@@ -2371,6 +2430,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            force_bvh_miss: false,
         })
         .unwrap();
         // The calls that read the SRV: 28 a dword, 7 with four a call.
@@ -2528,6 +2588,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            force_bvh_miss: false,
         })
         .unwrap();
         let mut dxil = l.dxil;

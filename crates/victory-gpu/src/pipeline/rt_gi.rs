@@ -50,13 +50,12 @@ fn skip_non_gi_trace_with(
     {
         return false;
     }
-    if !reflections
-        && (has(b"CS_RaytraceVBuffer")
-            || has(b"CS_Reflections_Raytrace")
-            || has(b"CS_GlossyReflections"))
-    {
-        return true;
-    }
+    // Note: reflection traces (CS_RaytraceVBuffer / CS_Reflections_Raytrace /
+    // CS_GlossyReflections) are NOT skipped as dropped pipelines here: instead,
+    // `victory-shader` forces instant BVH root-misses for them when
+    // `!reflections`, so `CS_RayMiss` still shades off-screen foreground water
+    // reflections with the sky cubemap instead of leaving them black.
+    let _ = reflections;
     if !shadows && (has(b"CS_RaytracedShadows") || has(b"ShadowTrace")) {
         return true;
     }
@@ -98,10 +97,19 @@ mod tests {
             );
         }
 
-        for non_gi in [
+        for reflection_shader in [
             b"CS_RaytraceVBuffer_Primary".as_slice(),
             b"CS_Reflections_Raytrace_Glossy".as_slice(),
             b"CS_GlossyReflections_Trace".as_slice(),
+        ] {
+            assert!(
+                !skip_non_gi_trace_with(true, false, false, false, reflection_shader),
+                "reflection shader {:?} must stay enabled (using forced BVH miss) so CS_RayMiss shades off-screen water",
+                String::from_utf8_lossy(reflection_shader)
+            );
+        }
+
+        for non_gi in [
             b"CS_RaytracedShadows_Sun".as_slice(),
             b"CS_LocalLight_ShadowTrace".as_slice(),
         ] {

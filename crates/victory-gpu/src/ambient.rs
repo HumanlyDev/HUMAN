@@ -137,6 +137,16 @@ fn air() -> f32 {
     })
 }
 
+/// How many times the estimate the title's own result may keep
+/// (`VICTORY_AMBIENT_MOST=<multiple>`, 4 when unset).
+fn most() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_MOST").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(4.0)
+    })
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -272,6 +282,9 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
+    // A NaN or infinity in the air is summed along every view ray through it:
+    // black or white patches floating in the sky and rooms.
+    if (any(isnan(c)) || any(isinf(c))) { scattered[at] = 0; return; }
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
 }
@@ -364,6 +377,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
         }
         float3 was = unpack(light[p]);
         was = any(isnan(was)) || any(isinf(was)) ? 0.0 : was;
+        // Magenta/violet garbage the probes' memory held (green far under red and
+        // blue): dropped, as in VIctory-Belobug-AMD / VIctory-NVIDIA.
+        if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+        if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;
         float top = max(dot(found, LUMA) * most, 1e-6);
         float has = dot(was, LUMA);
         was *= min(1.0, top / max(has, 1e-6));
@@ -371,6 +388,8 @@ void raise(uint3 at : SV_DispatchThreadID) {
     } else {
         float3 was = unpack(light[p]);
         was = any(isnan(was)) || any(isinf(was)) ? 0.0 : was;
+        if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+        if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;
         float top = max(dot(found, LUMA) * 6.0, 4.0);
         float has = dot(was, LUMA);
         was *= min(1.0, top / max(has, 1e-6));
@@ -508,7 +527,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = most().to_bits();
     words[10] = air().to_bits();
     words[11] = rt_floor().to_bits();
     words[12] = views.depth_size[0].max(1);

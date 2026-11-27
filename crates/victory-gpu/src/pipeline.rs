@@ -256,17 +256,48 @@ fn code_walks(code: &[u8]) -> bool {
 #[cfg(windows)]
 pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether a compute shader has non-BVH sky/probe fallback code that should
+/// still run (with forced root BVH miss) when the BVH builder is off, unless
+/// `VICTORY_BVH_HOLD=all`.
+#[cfg(windows)]
+fn has_fallback_without_bvh(container: &[u8]) -> bool {
+    let has = |needle: &[u8]| container.windows(needle.len()).any(|w| w == needle);
+    if has(b"IrradianceCache") || has(b"ScreenProbes") || has(b"PrimaryProbes") {
+        return false;
+    }
+    has(b"CS_RaytraceVBuffer")
+        || has(b"CS_Reflections_Raytrace")
+        || has(b"CS_GlossyReflections")
+        || has(b"CS_SkyVisibility")
+}
+
 /// Whether a dispatch with the title's pipeline `this` is held back
 /// because its program walks ray-tracing structures nothing has built
-/// (`VICTORY_BVH_HOLD=0` runs them anyway; on by default).
+/// (`VICTORY_BVH_HOLD=0` runs them anyway; `VICTORY_BVH_HOLD=all` holds
+/// reflection and sky-visibility fallbacks too; on by default).
 #[cfg(windows)]
 pub(crate) fn walk_held(this: This) -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    if this.is_null() || !*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HOLD").is_none_or(|v| v != "0")) {
+    static MODE: OnceLock<(bool, bool)> = OnceLock::new();
+    if this.is_null() {
+        return false;
+    }
+    let &(hold, hold_all) = MODE.get_or_init(|| {
+        let val = std::env::var("VICTORY_BVH_HOLD").unwrap_or_default();
+        let trimmed = val.trim();
+        (trimmed != "0", trimmed.eq_ignore_ascii_case("all"))
+    });
+    if !hold {
         return false;
     }
     let p = pipeline(this);
     if !p.shaders.iter().any(|s| s.stage == "compute" && s.walks()) {
+        return false;
+    }
+    if !hold_all
+        && p.shaders
+            .iter()
+            .any(|s| s.stage == "compute" && has_fallback_without_bvh(&s.container))
+    {
         return false;
     }
     if BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole {
@@ -1002,5 +1033,16 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bvh_hold_exempts_reflection_and_sky_visibility_fallbacks() {
+        assert!(super::has_fallback_without_bvh(b"CS_RaytraceVBuffer"));
+        assert!(super::has_fallback_without_bvh(b"CS_Reflections_Raytrace_Glossy"));
+        assert!(super::has_fallback_without_bvh(b"CS_GlossyReflections_Trace"));
+        assert!(super::has_fallback_without_bvh(b"CS_SkyVisibility_Trace"));
+        assert!(!super::has_fallback_without_bvh(b"CS_ScreenProbes_Trace_Wave64"));
+        assert!(!super::has_fallback_without_bvh(b"CS_IrradianceCache_ShadowTrace"));
     }
 }
