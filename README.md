@@ -107,13 +107,13 @@ $env:VICTORY_GAME_DIR = "D:\Games\YourDump"
 Or using `scripts\play-nvidia.ps1`:
 
 ```powershell
-.\scripts\play-nvidia.ps1 -Title "<path-to-title.exe>" -Console series-s -RayTracing
+.\scripts\play-nvidia.ps1 -Title "<path-to-title.exe>" -Console series-x -RayTracing
 ```
 
 Or invoke `victory.exe` directly:
 
 ```powershell
-.\target\release\victory.exe run "<path-to-title.exe>" --console series-s --execute
+.\target\release\victory.exe run "<path-to-title.exe>" --console series-x --execute
 ```
 
 ### Pre-Warm Shaders & Pipelines
