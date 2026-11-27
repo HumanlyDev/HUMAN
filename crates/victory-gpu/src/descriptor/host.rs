@@ -4435,6 +4435,54 @@ fn make_twinned(
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
+                if desc.as_ref().is_none_or(|d| d.Format.0 == 0)
+                    && let Some(vf) = crate::resource::view_format(resource)
+                {
+                    // SAFETY: a live resource.
+                    let own = unsafe { texture.GetDesc() };
+                    let own_u32 = own.Format.0 as u32;
+                    let is_typeless = crate::resource::family(own_u32) == own_u32
+                        && crate::resource::family(own_u32 + 1) == own_u32;
+                    if is_typeless {
+                        let fmt = DXGI_FORMAT(vf as i32);
+                        if let Some(d) = &mut desc {
+                            d.Format = fmt;
+                        } else if own.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+                            let mut d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                                Format: fmt,
+                                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                                ..Default::default()
+                            };
+                            if own.DepthOrArraySize > 1 {
+                                d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                                d.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+                                    MipLevels: u32::MAX,
+                                    ArraySize: u32::from(own.DepthOrArraySize),
+                                    ..Default::default()
+                                };
+                            } else {
+                                d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                                d.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                                    MipLevels: u32::MAX,
+                                    ..Default::default()
+                                };
+                            }
+                            desc = Some(d);
+                        } else if own.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                            desc = Some(D3D12_SHADER_RESOURCE_VIEW_DESC {
+                                Format: fmt,
+                                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE3D,
+                                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                    Texture3D: D3D12_TEX3D_SRV {
+                                        MipLevels: u32::MAX,
+                                        ..Default::default()
+                                    },
+                                },
+                            });
+                        }
+                    }
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }

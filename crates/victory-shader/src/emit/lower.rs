@@ -11041,6 +11041,7 @@ impl<'a> Lower<'a> {
             let d = self
                 .s
                 .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+            let zero = self.s.m.i32(0);
             let one = self.s.m.i32(1);
             let present = match kind {
                 1 => [true, false, false, true],
@@ -11051,7 +11052,9 @@ impl<'a> Lower<'a> {
                 return Err("an image result");
             };
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                let x = if ch == 3 && uav || !present[ch as usize] {
+                let x = if !present[ch as usize] {
+                    zero
+                } else if ch == 3 && uav {
                     one
                 } else {
                     self.s.m.extract(c, d, ch)
@@ -11514,6 +11517,7 @@ impl<'a> Lower<'a> {
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
         };
+        let c = self.cur;
         let mut xs = Vec::new();
         for ch in channels {
             let x = match gathered {
