@@ -97,7 +97,7 @@ Using `Play-HUMAN.cmd` (or `Play-VIctory.cmd` for CGBJ defaults):
 ```powershell
 $env:VICTORY_GAME_DIR = "D:\Games\YourDump"
 
-# Tuned Pareto residency + Ray-Traced Global Illumination (stable 10 FPS on RTX 4060)
+# Tuned Pareto residency + Ray-Traced Global Illumination (stable 10 FPS on RTX 4070 Ti)
 .\Play-HUMAN.cmd rt-gi
 
 # Fast Pareto residency with screen-space SH ambient fallback
