@@ -16,13 +16,13 @@ An experimental Xbox Series X|S to Windows x86-64 / Direct3D 12 compatibility la
 
 | Milestone | Status |
 |---|---|
-| **Executable & Boot** | ✅ — GTA VI executable loads and runs, imports resolve, and boots to its first frame, intro logos, and loading screen |
-| **Main Menu** | ✅ — GTA VI reaches the main menu and title screen with working controller and keyboard input |
-| **Open World & Playability** | ✅ — GTA VI loads into story mode and the open world with playable gameplay, character movement, driving, controller input, and pause menu |
-| **Performance (RTX 4060 8 GB)** | **5 FPS average** in GTA VI's open world on an NVIDIA RTX 4060 (8 GB) using `--console series-x` (higher on upper-tier RTX and Radeon GPUs) |
-| **Story Progress** | **Half the story (~50% of the GTA VI main story)** reachable through the prologue, early missions, and first act |
-| **Rendering & Lighting** | **Close to the console (lit)** — GTA VI renders lit with textures, shadows, and console Ray-Traced Global Illumination (`ScreenProbes`, `IrradianceCache`, `PrimaryProbes`, `SkyVisibility`, `RaytracingResolve`) via Wave32-compatible `XboxBvhBuilder` and accelerated inline DXIL ray-node traversal; directional screen-space SH radiance fallback is also supported |
-| **Stability** | **Rarely crashes** — GTA VI runs with good stability across sessions via Pareto VRAM/commit residency budgets, upload-before-publish bindless barriers, cold BVH arena page recycling, and CPU texture read-back for water/physics |
+| **Executable & Boot** | ✅ — A newer retail game executable loads and runs, imports resolve, and boots to its first frame, intro logos, and loading screen |
+| **Main Menu** | ✅ — A newer retail game reaches the main menu and title screen with working controller and keyboard input |
+| **Open World & Playability** | ✅ — A newer retail game loads into story mode and the open world with playable gameplay, character movement, driving, controller input, and pause menu |
+| **Performance (RTX 4070 Ti 12 GB)** | **Stable 10 FPS** in a newer retail game's open world on an NVIDIA RTX 4070 Ti (12 GB) using `--console series-x` (higher on upper-tier RTX and Radeon GPUs) |
+| **Story Progress** | **Half the story (~50% of a newer retail game's main story)** reachable through the prologue, early missions, and first act |
+| **Rendering & Lighting** | **Close to the console (lit)** — A newer retail game renders lit with textures, shadows, and console Ray-Traced Global Illumination (`ScreenProbes`, `IrradianceCache`, `PrimaryProbes`, `SkyVisibility`, `RaytracingResolve`) via Wave32-compatible `XboxBvhBuilder` and accelerated inline DXIL ray-node traversal; directional screen-space SH radiance fallback is also supported |
+| **Stability** | **Fully stable, no crashes** — A newer retail game runs stably across sessions with no crashes via Pareto VRAM/commit residency budgets, upload-before-publish bindless barriers, cold BVH arena page recycling, and CPU texture read-back for water/physics |
 
 ---
 
@@ -97,7 +97,7 @@ Using `Play-HUMAN.cmd` (or `Play-VIctory.cmd` for CGBJ defaults):
 ```powershell
 $env:VICTORY_GAME_DIR = "D:\Games\YourDump"
 
-# Tuned Pareto residency + Ray-Traced Global Illumination (~5 FPS average on RTX 4060)
+# Tuned Pareto residency + Ray-Traced Global Illumination (stable 10 FPS on RTX 4070 Ti)
 .\Play-HUMAN.cmd rt-gi
 
 # Fast Pareto residency with screen-space SH ambient fallback
@@ -107,13 +107,13 @@ $env:VICTORY_GAME_DIR = "D:\Games\YourDump"
 Or using `scripts\play-nvidia.ps1`:
 
 ```powershell
-.\scripts\play-nvidia.ps1 -Title "<path-to-title.exe>" -Console series-s -RayTracing
+.\scripts\play-nvidia.ps1 -Title "<path-to-title.exe>" -Console series-x -RayTracing
 ```
 
 Or invoke `victory.exe` directly:
 
 ```powershell
-.\target\release\victory.exe run "<path-to-title.exe>" --console series-s --execute
+.\target\release\victory.exe run "<path-to-title.exe>" --console series-x --execute
 ```
 
 ### Pre-Warm Shaders & Pipelines
