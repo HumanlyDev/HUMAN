@@ -736,3 +736,41 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
         }
     }
 }
+
+#[test]
+fn multi_wave_lds_shader_splits_lds_on_wave32() {
+    let mut native = native_of(
+        &[
+            0xD834_0000,
+            0x0000_0000, // ds_write_b32 v0, v0
+        ],
+        true,
+        128,
+    );
+    if let StageIo::Cs(ref mut cs) = native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower::lower_counted(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    }, false);
+    lower::TEST_HOST_WAVE.set(was);
+    let lowered = lowered.expect("lower");
+    assert_eq!(lowered.wave_size, Some(32));
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = lowered.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+}
