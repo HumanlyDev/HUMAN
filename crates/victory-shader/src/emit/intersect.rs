@@ -59,6 +59,22 @@ struct Ray {
     inverse: [V; 3],
 }
 
+/// `VICTORY_BVH_MISS=1`: the node test misses every node without reading BVH
+/// memory. While the title's structure builder is off (`VICTORY_BVH_BUILDER=0`
+/// and `VICTORY_RT_GI=0`), walking unbuilt memory produces garbage hits on
+/// vegetation and routes off-screen water reflection rays to skipped resolve
+/// shaders instead of `CS_RayMiss`. Ported from trustno1-coder/VIctory-NVIDIA.
+fn bvh_miss_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER")
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            || std::env::var_os("VICTORY_RT_GI")
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        !builder && std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1")
+    })
+}
+
 impl<'a> Lower<'a> {
     /// `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`.
     pub(super) fn bvh(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -134,45 +150,63 @@ impl<'a> Lower<'a> {
             direction: [f[4], f[5], f[6]],
             inverse: [f[7], f[8], f[9]],
         };
+        let miss = self.x.force_bvh_miss || bvh_miss_env();
         let c = self.cur;
-        let at = match nodes {
-            BvhNodes::Resource => {
-                let src = self
-                    .descriptors
-                    .get(&(site, false))
-                    .copied()
-                    .ok_or("an untracked ray-tracing structure")?;
-                let handle = self.handle(site, src, false, (11, 0))?;
-                // (pointer >> 3) << 6 from the buffer's start.
-                let (kind_bits, k3) = (self.s.m.i32(!7), self.s.m.i32(3));
-                let byte = self.s.m.bin(c, Bin::And, pointer, kind_bits);
-                let byte = self.s.m.bin(c, Bin::Shl, byte, k3);
-                NodeAt::Buffer { handle, byte }
-            }
-            BvhNodes::Memory { .. } => {
+        let at = if miss {
+            // Still validate SGPR descriptor presence as before, without
+            // reading BVH memory or recording faults on unbuilt structures.
+            if let BvhNodes::Memory { .. } = nodes {
                 let Operand::Scalar { code, .. } = *rsrc else {
                     return Err("a ray-tracing structure descriptor not in SGPRs");
                 };
-                let mut words = [pointer; 2];
-                for (k, w) in words.iter_mut().enumerate() {
+                for k in 0..2 {
                     let v = inst
                         .read(Reg::S(code + k as u8))
                         .ok_or("an unread operand")?;
-                    *w = self.i32_of(v)?;
-                }
-                let (low, high) = self.bvh_address(words[0], words[1], pointer, pointer_high);
-                // One look for the node's copy, before the branches: a
-                // node is 64 bytes on 64, so its first half lies in one
-                // 64 KiB page whatever its kind.
-                let (handle, byte, mapped) = self.bvh_memory(low, high, guard);
-                NodeAt::Memory {
-                    handle,
-                    byte,
-                    low,
-                    high,
-                    mapped,
+                    let _ = self.i32_of(v)?;
                 }
             }
+            None
+        } else {
+            Some(match nodes {
+                BvhNodes::Resource => {
+                    let src = self
+                        .descriptors
+                        .get(&(site, false))
+                        .copied()
+                        .ok_or("an untracked ray-tracing structure")?;
+                    let handle = self.handle(site, src, false, (11, 0))?;
+                    // (pointer >> 3) << 6 from the buffer's start.
+                    let (kind_bits, k3) = (self.s.m.i32(!7), self.s.m.i32(3));
+                    let byte = self.s.m.bin(c, Bin::And, pointer, kind_bits);
+                    let byte = self.s.m.bin(c, Bin::Shl, byte, k3);
+                    NodeAt::Buffer { handle, byte }
+                }
+                BvhNodes::Memory { .. } => {
+                    let Operand::Scalar { code, .. } = *rsrc else {
+                        return Err("a ray-tracing structure descriptor not in SGPRs");
+                    };
+                    let mut words = [pointer; 2];
+                    for (k, w) in words.iter_mut().enumerate() {
+                        let v = inst
+                            .read(Reg::S(code + k as u8))
+                            .ok_or("an unread operand")?;
+                        *w = self.i32_of(v)?;
+                    }
+                    let (low, high) = self.bvh_address(words[0], words[1], pointer, pointer_high);
+                    // One look for the node's copy, before the branches: a
+                    // node is 64 bytes on 64, so its first half lies in one
+                    // 64 KiB page whatever its kind.
+                    let (handle, byte, mapped) = self.bvh_memory(low, high, guard);
+                    NodeAt::Memory {
+                        handle,
+                        byte,
+                        low,
+                        high,
+                        mapped,
+                    }
+                }
+            })
         };
         let zero = self.s.m.i32(0);
         let gate = self.begin_guarded(guard);
@@ -191,11 +225,17 @@ impl<'a> Lower<'a> {
             .m
             .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
         self.cur = box_block;
-        let boxes = self.bvh_boxes(at, kind, &ray, sort);
+        let boxes = match at {
+            Some(at) => self.bvh_boxes(at, kind, &ray, sort),
+            None => [self.s.m.i32(bvh::NONE); 4],
+        };
         let box_end = self.cur;
         self.s.m.terminate(box_end, Term::Br(join));
         self.cur = triangle_block;
-        let triangle = self.bvh_triangle(at, kind, &ray);
+        let triangle = match at {
+            Some(at) => self.bvh_triangle(at, kind, &ray),
+            None => bvh::MISS.map(|f| self.s.m.i32(f.to_bits())),
+        };
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
         self.cur = join;

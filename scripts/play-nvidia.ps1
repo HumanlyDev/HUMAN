@@ -58,6 +58,7 @@ $env:VICTORY_CARD_BUFFERS_MIN_KB = '64'
 $env:VICTORY_LEVELS_ON_DEMAND = '1'
 $env:VICTORY_AMBIENT_AIR = '1.5'
 $env:VICTORY_AMBIENT = $Ambient
+$env:VICTORY_NAN_SCRUB = '1'
 
 if ($RayTracing) {
     $env:VICTORY_RT_GI = '1'
@@ -65,6 +66,9 @@ if ($RayTracing) {
     $env:VICTORY_BVH_FENCES = '0'
     $env:VICTORY_FAST_BVH = '1'
     $env:VICTORY_RT_LOOP_LIMIT = "$RtLoopLimit"
+    Remove-Item Env:VICTORY_BVH_MISS -ErrorAction SilentlyContinue
+} else {
+    $env:VICTORY_BVH_MISS = '1'
 }
 
 & $Exe run $Title --execute --console $Console

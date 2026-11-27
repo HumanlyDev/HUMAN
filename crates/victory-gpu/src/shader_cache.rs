@@ -78,6 +78,11 @@ fn build() -> [u8; 32] {
             "VICTORY_FAST_BVH",
             "VICTORY_RT_LOOP_LIMIT",
             "VICTORY_RT_GI",
+            "VICTORY_RT_ALL",
+            "VICTORY_RT_REFLECTIONS",
+            "VICTORY_BVH_MISS",
+            "VICTORY_NAN_SCRUB",
+            "VICTORY_THREAD_TICKET",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');

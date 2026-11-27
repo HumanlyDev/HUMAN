@@ -3216,7 +3216,9 @@ impl State {
             let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
                 return None;
             };
-            let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
+            let view = crate::descriptor::view(table + u64::from(offset) * 4)?;
+            let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
+            let resource = match view {
                 View::Shader(r, _) | View::Unordered(r, ..) => r,
                 _ => return None,
             };
@@ -3229,6 +3231,61 @@ impl State {
             let desc = unsafe { host.GetDesc() };
             Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
         };
+        fn stencil_view(view: Option<View>) -> bool {
+            let view = view.map(|v| crate::descriptor::host::placed_texture(&v).unwrap_or(v));
+            match view {
+                Some(View::Shader(_, Some(d))) => {
+                    matches!(crate::resource::pc_format(d[0]), 22 | 47) || (d[1] == 4 && d[6] == 1)
+                }
+                _ => false,
+            }
+        }
+        let stencil_at = |(slot, offset): (u8, u32)| {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return false;
+            };
+            stencil_view(crate::descriptor::view(table + u64::from(offset) * 4))
+        };
+        let depth_like = |d: &D3D12_RESOURCE_DESC| {
+            use windows::Win32::Graphics::Dxgi::Common::{
+                DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT,
+                DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R24G8_TYPELESS,
+                DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+            };
+            d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && matches!(
+                    d.Format,
+                    DXGI_FORMAT_R32_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT
+                        | DXGI_FORMAT_R32G8X24_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                        | DXGI_FORMAT_R24G8_TYPELESS
+                        | DXGI_FORMAT_D24_UNORM_S8_UINT
+                )
+        };
+        let scan = |kind: ResourceType, fits: &dyn Fn(&D3D12_RESOURCE_DESC) -> bool| {
+            t.used
+                .iter()
+                .filter(|u| u.kind == kind && u.root == RootType::Table)
+                .filter(|u| kind != ResourceType::Srv || !stencil_at((u.slot, u.table_offset_dwords)))
+                .filter_map(|u| entry(kind, (u.slot, u.table_offset_dwords)))
+                .find(|(desc, _)| fits(desc))
+        };
+        let usual_depth = |at: (u8, u32)| {
+            if stencil_at(at) {
+                static STENCIL: AtomicU64 = AtomicU64::new(0);
+                if STENCIL.fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::info!(
+                        ?role,
+                        ?at,
+                        "stand-in: the depth place names a stencil plane; another depth view of the tables is taken (counted once)"
+                    );
+                }
+                None
+            } else {
+                entry(ResourceType::Srv, at)
+            }
+        };
         let at = match role {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
@@ -3236,7 +3293,11 @@ impl State {
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
-            Role::Resolve => entry(ResourceType::Srv, DEPTH),
+            Role::Resolve => usual_depth(DEPTH).or_else(|| {
+                let size = image.as_ref().map(|(d, _)| (d.Width, d.Height));
+                scan(ResourceType::Srv, &|d| depth_like(d) && size == Some((d.Width, d.Height)))
+                    .or_else(|| scan(ResourceType::Srv, &|d| depth_like(d) && d.Width > 0 && d.Height > 0))
+            }),
             Role::Radiance | Role::Air => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {

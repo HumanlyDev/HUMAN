@@ -37,6 +37,7 @@ if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=8"
 if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
 if not defined VICTORY_LEVELS_ON_DEMAND set "VICTORY_LEVELS_ON_DEMAND=1"
 if not defined VICTORY_CARD_BUFFERS_MIN_KB set "VICTORY_CARD_BUFFERS_MIN_KB=64"
+if not defined VICTORY_NAN_SCRUB set "VICTORY_NAN_SCRUB=1"
 if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=warn"
 if /i "%mode%"=="rt-gi" (
   if not defined VICTORY_RT_GI set "VICTORY_RT_GI=1"
@@ -44,6 +45,8 @@ if /i "%mode%"=="rt-gi" (
   if not defined VICTORY_BVH_FENCES set "VICTORY_BVH_FENCES=0"
   if not defined VICTORY_FAST_BVH set "VICTORY_FAST_BVH=1"
   if not defined VICTORY_RT_LOOP_LIMIT set "VICTORY_RT_LOOP_LIMIT=96"
+) else (
+  if not defined VICTORY_BVH_MISS if not "%VICTORY_BVH_BUILDER%"=="1" if not "%VICTORY_RT_GI%"=="1" set "VICTORY_BVH_MISS=1"
 )
 "%runner%" run "%VICTORY_GAME_DIR%\game_scarlett_master.exe" --console series-s --execute
 exit /b %errorlevel%
