@@ -129,6 +129,65 @@ pub use shader::{
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
+/// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` of a console pixel program.
+pub(crate) const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+/// `DB_SHADER_CONTROL`'s Z_EXPORT_ENABLE, STENCIL_TEST_VAL_EXPORT_ENABLE and
+/// STENCIL_OP_VAL_EXPORT_ENABLE: the program writes depth or stencil.
+const DEPTH_STENCIL_EXPORT: u32 = 0b111;
+
+#[cfg(test)]
+thread_local! {
+    /// [`early_depth`] for the tests of one thread.
+    static EARLY_DEPTH_FOR_TESTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_EARLY_DEPTH=1`: a pixel program whose console code tests depth and
+/// stencil before it runs ([`DEPTH_BEFORE_SHADER`]) gets D3D12's early
+/// depth-stencil test too (DXIL shader flag ForceEarlyDepthStencil). Off by
+/// default. Part of the translation: the shader cache keys on it.
+pub fn early_depth() -> bool {
+    #[cfg(test)]
+    if let Some(on) = EARLY_DEPTH_FOR_TESTS.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_some_and(|v| v == "1"))
+}
+
+/// What a pixel program gets of its console code's early depth test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EarlyDepth {
+    NotAsked,
+    Given,
+    Off,
+    Exports,
+}
+
+/// [`EarlyDepth`] of a pixel program with `db_shader_control` and these
+/// outputs, with [`early_depth`] `on`. Pure, for testing.
+pub(crate) fn early_depth_of(db_shader_control: u32, outputs: &[container::SigElement], on: bool) -> EarlyDepth {
+    if db_shader_control & DEPTH_BEFORE_SHADER == 0 {
+        EarlyDepth::NotAsked
+    } else if db_shader_control & DEPTH_STENCIL_EXPORT != 0
+        || outputs.iter().any(|o| (17..=20).contains(&o.kind))
+    {
+        EarlyDepth::Exports
+    } else if on {
+        EarlyDepth::Given
+    } else {
+        EarlyDepth::Off
+    }
+}
+
+static EARLY_DEPTH_COUNTS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Pixel programs translated since the start whose console code tests depth
+/// before them ([`early_depth`]): given, left late (switch off), left late (exports).
+pub fn early_depth_counts() -> [u64; 3] {
+    EARLY_DEPTH_COUNTS.each_ref().map(|n| n.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///
@@ -1018,6 +1077,12 @@ fn emit_program(
         _ => 0,
     };
     let force_bvh_miss = rt_gi_reflection_miss(c, native);
+    let early = match &native.io {
+        crate::native::StageIo::Ps { db_shader_control, .. } => {
+            early_depth_of(*db_shader_control, &outputs, early_depth())
+        }
+        _ => EarlyDepth::NotAsked,
+    };
     let l = lower::lower(&lower::Parts {
         native,
         p,
@@ -1030,6 +1095,15 @@ fn emit_program(
         mesh_stride,
         force_bvh_miss,
     })?;
+    let counted = match early {
+        EarlyDepth::NotAsked => None,
+        EarlyDepth::Given => Some(0),
+        EarlyDepth::Off => Some(1),
+        EarlyDepth::Exports => Some(2),
+    };
+    if let Some(n) = counted {
+        EARLY_DEPTH_COUNTS[n].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,

@@ -1219,6 +1219,7 @@ impl Staging {
         if self.layout.slices != 1 || mips.is_empty() || mips.len() > 32 {
             return u32::MAX;
         }
+        let first = first.max(u64::from(crate::resource::drop_mips()).min((mips.len() - 1) as u64));
         let tail = (self.layout.first_tail_mip as usize).min(mips.len());
         let there = |from: u64, to: u64| {
             to > from && to <= limit && committed(self.memory.wrapping_add(from as usize), (to - from) as usize)

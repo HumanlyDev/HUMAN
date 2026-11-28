@@ -92,6 +92,43 @@ fn ask(what: &str, from: u32) {
     }
 }
 
+/// Whether the threads the submitting thread waits for run at its priority
+/// (`VICTORY_HELPER_PRIORITY`, on unless `0`).
+fn helpers_raised() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_PRIORITY").is_none_or(|v| v != "0"))
+}
+
+/// A helper's priority ([`helpers_raised`]). [`Self::keep`] is called before
+/// each piece of work; it asks the system only when the switch has changed.
+pub(crate) struct Priority {
+    applied: Option<bool>,
+}
+
+impl Priority {
+    pub(crate) fn new() -> Self {
+        let mut priority = Self { applied: None };
+        priority.keep();
+        priority
+    }
+
+    pub(crate) fn keep(&mut self) {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadSelectedCpuSets, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+            THREAD_PRIORITY_NORMAL,
+        };
+        let _ = SetThreadSelectedCpuSets;
+        let on = helpers_raised();
+        if self.applied == Some(on) {
+            return;
+        }
+        let priority = if on { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL };
+        // SAFETY: our own thread.
+        unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+        self.applied = Some(on);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

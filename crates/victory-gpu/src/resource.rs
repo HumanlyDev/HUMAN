@@ -1238,6 +1238,19 @@ struct Hosted {
     grown: std::sync::atomic::AtomicBool,
 }
 
+/// Extra mip levels to drop from the top of filled 2D textures
+/// (`VICTORY_TEXTURE_DROP_MIPS=N`; 0 by default) so lower-resolution
+/// textures fit in limited VRAM.
+pub(crate) fn drop_mips() -> u32 {
+    static DROP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DROP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_DROP_MIPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// Whether a texture the title places in memory is read, kept and uploaded
 /// from the first level its views show on (`VICTORY_HELD_LEVELS=0`: whole,
 /// as before). Such a title describes every level of a texture and views it
@@ -1556,7 +1569,8 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
             let partly = readable
                 && bytes >= crate::tiles::floor()
-                && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
+                && (drop_mips() > 0
+                    || !crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
             let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };

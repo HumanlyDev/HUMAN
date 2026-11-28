@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod native_1440p;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;

@@ -96,6 +96,9 @@ pub(crate) struct Shadow {
     changes_only: std::sync::atomic::AtomicBool,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
+    /// Whether all of the copy's title memory was asked for write-combined
+    /// (`0` unknown, `1` no, `2` yes; [`Shadow::write_combined`]).
+    wc: AtomicU8,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -184,7 +187,7 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     const TWELVE_GIB_MB: u64 = 12 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
     if budget_mb <= TWELVE_GIB_MB {
-        (16, 512)
+        (16, (budget_mb * 18 / 100).clamp(512, 2048))
     } else if budget_mb < TWENTY_GIB_MB {
         (4, 2048)
     } else {
@@ -1547,8 +1550,10 @@ fn workers() -> &'static Workers {
         for i in 0..wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
+                let mut priority = crate::cores::Priority::new();
                 let workers = WORKERS.get().expect("made above");
                 loop {
+                    priority.keep();
                     let job = {
                         // A little while awake first: the next work comes
                         // within microseconds more often than not.
@@ -1582,6 +1587,7 @@ fn wide(jobs: Vec<Job>) {
     }
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
+    let wake = (jobs.len() - 1).min(wide_threads());
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1598,7 +1604,11 @@ fn wide(jobs: Vec<Job>) {
             }));
         }
     }
-    workers.more.notify_all();
+    if wake >= wide_threads() {
+        workers.more.notify_all();
+    } else {
+        (0..wake).for_each(|_| workers.more.notify_one());
+    }
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {
@@ -3023,6 +3033,66 @@ unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
+/// Title memory the title asked for write-combined (the console's 0x400
+/// protection bit), as `[start, end)` ([`title_memory_write_combined`]).
+static WRITE_COMBINED: RwLock<Vec<(u64, u64)>> = RwLock::new(Vec::new());
+
+/// The title asked for `[at, at + len)` write-combined: its CPU writes the
+/// memory and does not read it.
+pub fn title_memory_write_combined(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut all = WRITE_COMBINED.write().unwrap_or_else(|e| e.into_inner());
+    all.push((at as u64, (at + len) as u64));
+}
+
+/// The title let go of `[at, at + len)` (`len` 0: of the allocation at `at`):
+/// write-combined regions in it are forgotten.
+pub(crate) fn write_combined_freed(at: usize, len: usize) {
+    let (at, end) = (at as u64, at.saturating_add(len) as u64);
+    let mut all = WRITE_COMBINED.write().unwrap_or_else(|e| e.into_inner());
+    all.retain(|&(from, to)| {
+        if len == 0 {
+            from != at
+        } else {
+            to <= at || from >= end
+        }
+    });
+}
+
+/// Whether all of `[start, start + len)` lies in write-combined title memory.
+fn is_write_combined(start: u64, len: u64) -> bool {
+    let all = WRITE_COMBINED.read().unwrap_or_else(|e| e.into_inner());
+    all.iter()
+        .any(|&(from, to)| from <= start && start + len <= to)
+}
+
+/// Whether what shaders write into copies in the card's memory of
+/// write-combined title memory stays on the card and is not compared,
+/// fetched and merged into title memory (`VICTORY_WC_NO_BACK=1`; off by default).
+fn wc_no_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_NO_BACK").is_some_and(|v| v == "1"))
+}
+
+/// The smallest copy whose shader writes [`wc_no_back`] leaves on the card,
+/// in bytes (`VICTORY_WC_NO_BACK_MIN_KB`, 0 unset: all).
+fn wc_no_back_min() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("VICTORY_WC_NO_BACK_MIN_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            * 1024
+    })
+}
+
+/// Bytes shaders were declared to write in write-combined copies and that
+/// were left on the card ([`wc_no_back`]).
+pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
+
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
@@ -3136,6 +3206,7 @@ impl Shadow {
             window: false,
             changes_only: Default::default(),
             mapped: false,
+            wc: AtomicU8::new(0),
             place: None,
         }
     }
@@ -3165,9 +3236,35 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        if self.card.is_some() && wc_no_back() && self.len >= wc_no_back_min() && self.write_combined() {
+            self.written.store(true, Ordering::Relaxed);
+            WC_LEFT.fetch_add(len.min(self.left(address)), Ordering::Relaxed);
+            return;
+        }
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// Whether all of the copy's title memory was asked for write-combined
+    /// ([`title_memory_write_combined`]); found once.
+    fn write_combined(&self) -> bool {
+        match self.wc.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let wc = is_write_combined(self.start, self.len);
+                self.wc.store(if wc { 2 } else { 1 }, Ordering::Relaxed);
+                if wc {
+                    tracing::info!(
+                        start = format_args!("{:#x}", self.start),
+                        len = format_args!("{:#x}", self.len),
+                        "write-combined title memory: what shaders write in its copy is not copied back (VICTORY_WC_NO_BACK)"
+                    );
+                }
+                wc
+            }
+        }
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -5579,9 +5676,9 @@ mod window_tests {
 
         // Unknown (WARP / query failure) and <= 12 GiB keep the 12 GB baseline.
         assert_eq!(default_card_limits_mb(None), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 1474));
+        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 2027));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 2048));
 
         // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
         assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));

@@ -372,6 +372,15 @@ pub(crate) fn keep_freed() -> bool {
 /// when free physical RAM is low. Never returns less than 2,000 ms.
 /// With plenty of it five minutes ([`keep_freed`]).
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+    static OVERRIDE: OnceLock<Option<u64>> = OnceLock::new();
+    if let Some(ms) = *OVERRIDE.get_or_init(|| {
+        std::env::var("VICTORY_RAM_IDLE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|ms| ms.max(500))
+    }) {
+        return ms;
+    }
     let effective = match (avail_phys, crate::residency::headroom()) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -1266,6 +1275,9 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// Left open and empty, as made or reset, for the title's next reset
+    /// ([`HostList::leave_open`]): `epoch + 1`, or `0` if not left open.
+    left_open: std::sync::atomic::AtomicU64,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// Set by [`HostList::pass_plane`] when it binds its own graphics state
@@ -1283,6 +1295,14 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// Whether the new host list each of the title's lists gets when it is
+/// submitted is left open for the title's next reset ([`HostList::leave_open`];
+/// `VICTORY_FRESH_OPEN=0`: closed at once and reset again, as before).
+fn fresh_open() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FRESH_OPEN").is_none_or(|v| v != "0"))
+}
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -4195,6 +4215,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                left_open: std::sync::atomic::AtomicU64::new(0),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6351,6 +6372,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        self.left_open.store(0, Ordering::Release);
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -6399,9 +6421,48 @@ impl HostList {
             .splice(at..at, found.into_iter().map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)));
     }
 
+    /// A new host list for one of the title's lists (`crate::list::detach`),
+    /// open and empty as it was made or reset: left so for the title's next
+    /// reset ([`fresh_open`]), or closed now.
+    pub(crate) fn leave_open(&self) {
+        if !fresh_open() {
+            self.close();
+            return;
+        }
+        self.left_open.store(self.epoch() + 1, Ordering::Release);
+    }
+
+    /// A host list taken from one of the title's lists to run: closed first if
+    /// it was left open ([`HostList::leave_open`]).
+    pub(crate) fn close_if_left_open(&self) {
+        if self.left_open.load(Ordering::Acquire) != 0 {
+            self.close();
+        }
+    }
+
+    /// Whether the list is still open and empty as [`HostList::leave_open`]
+    /// left it.
+    fn still_left_open(&self) -> bool {
+        let epoch = self.left_open.swap(0, Ordering::AcqRel);
+        if epoch == 0 {
+            return false;
+        }
+        let untouched = epoch == self.epoch() + 1
+            && self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            && self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+        if untouched {
+            return true;
+        }
+        // SAFETY: our list, open; what went into it goes with the reset.
+        let _ = unsafe { self.list.Close() };
+        false
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        let left_open = self.still_left_open();
         self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -6441,14 +6502,16 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
-        };
-        if let Err(e) = reset {
-            fail(format_args!("a host command list did not reset ({e})"));
+        if !left_open {
+            // SAFETY: the list is not executing.
+            let reset = unsafe {
+                self.allocator
+                    .Reset()
+                    .and_then(|()| self.list.Reset(&self.allocator, None))
+            };
+            if let Err(e) = reset {
+                fail(format_args!("a host command list did not reset ({e})"));
+            }
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);

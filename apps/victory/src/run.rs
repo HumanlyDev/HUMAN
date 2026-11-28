@@ -67,14 +67,36 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare_owned(original)?;
+    let mut prepared = victory_loader::prepare_owned(original)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
 
-    let images = cfg.cache_subdir("images")?;
+    let render_1080p = std::env::var("VICTORY_RENDER_1080P").as_deref() == Ok("1");
+    let native_1440p = render_1080p || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1");
+    let images = if native_1440p {
+        anyhow::ensure!(matches!(console, Console::SeriesX), "1440p output needs the Series X profile");
+        let (w, h) = crate::native_1440p::prepare(&mut prepared, render_1080p)?;
+        // SAFETY: nothing else runs yet; DXGI reads this later.
+        unsafe {
+            std::env::set_var(
+                "VICTORY_DISPLAY_MODE",
+                format!("{}x{}", crate::native_1440p::WIDTH, crate::native_1440p::HEIGHT),
+            );
+            std::env::set_var("VICTORY_NATIVE_1440P", "1");
+        }
+        println!(
+            "display        {}x{} SDR, scene {w}x{h}",
+            crate::native_1440p::WIDTH,
+            crate::native_1440p::HEIGHT
+        );
+        let dir = if render_1080p { "images/render-1080p-sdr" } else { "images/native-1440p-sdr" };
+        cfg.cache_subdir(dir)?
+    } else {
+        cfg.cache_subdir("images")?
+    };
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
     // The program is mapped from the copy `load` wrote: the patched bytes are
