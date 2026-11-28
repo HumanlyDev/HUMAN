@@ -2636,7 +2636,12 @@ pub(crate) fn host_tiled(this: This) -> Option<OnDemand> {
 /// (`crate::tiles::Tiled::first_shown`).
 #[cfg(windows)]
 pub(crate) fn first_shown(this: This) -> Option<u32> {
-    host_tiled(this)?.tiled()?.first_shown()
+    let tiled = host_tiled(this)?;
+    let tiled = tiled.tiled()?;
+    tiled.first_shown().or_else(|| {
+        let drop = drop_mips();
+        (drop > 0).then_some(drop)
+    })
 }
 
 /// A host copy made without memory of its own (`crate::tiles`), as a
