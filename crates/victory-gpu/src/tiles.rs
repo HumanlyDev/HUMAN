@@ -378,7 +378,14 @@ impl Tiled {
         let named = held | card;
         // The levels the card itself writes are few and are not kept
         // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        let packed_mask = if self.packed > 0 && !given.packed {
+            let first_packed = self.standard.len() as u32;
+            self.every_level() & !((1u32 << first_packed).wrapping_sub(1))
+        } else {
+            0
+        };
+        let may = if room { named } else { card | (named & packed_mask) };
+        let changed = self.give_locked(&mut given, queue, device, texture, named, may);
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
     }

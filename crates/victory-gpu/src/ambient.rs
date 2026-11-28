@@ -124,7 +124,7 @@ fn rt_floor() -> f32 {
 /// stale/disoccluded probe-tile blocks appear on camera movement.
 fn keep_sky() -> bool {
     static SET: OnceLock<bool> = OnceLock::new();
-    *SET.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_KEEP_SKY").is_some_and(|v| v == "1"))
+    *SET.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_KEEP_SKY").is_none_or(|v| v != "0"))
 }
 
 /// The most the air scatters, as a multiple of the light around
@@ -368,7 +368,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
         found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
         found = clamp(found, 0.2 * all, 2.5 * all);
         found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
-        found = max(found, float3(0.025, 0.025, 0.03) * level * open);
+        found = max(found, float3(0.06, 0.06, 0.07) * level * open);
     }
     if (!rt_mode) {
         if (!keep_sky_flag) {
