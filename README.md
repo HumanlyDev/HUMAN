@@ -141,7 +141,7 @@ When no XInput controller is connected, the keyboard maps to a standard pad whil
 
 ### Recommended Settings (RTX 4060 8 GB / Ryzen 5 7600 / 32 GB RAM, Native 1440p)
 
-Tested in a newer retail game (`--console series-x`, **9 FPS average**):
+Tested in a newer retail game (`--console series-x`, **8 FPS average**):
 
 ```powershell
 # Display & Shader Translation
