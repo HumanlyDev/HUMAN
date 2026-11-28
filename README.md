@@ -19,6 +19,7 @@ An experimental Xbox Series X|S to Windows x86-64 / Direct3D 12 compatibility la
 | **Executable & Boot** | ✅ — A newer retail game executable loads and runs, imports resolve, and boots to its first frame, intro logos, and loading screen |
 | **Main Menu** | ✅ — A newer retail game reaches the main menu and title screen with working controller and keyboard input |
 | **Open World & Playability** | ✅ — A newer retail game loads into story mode and the open world with playable gameplay, character movement, driving, controller input, and pause menu |
+| **Performance (RTX 4060 8 GB)** | **9 FPS average** in a newer retail game on an **NVIDIA RTX 4060 (8 GB)** with **AMD Ryzen 5 7600** and **32 GB RAM** using `--console series-x` at **native 1440p** (`VICTORY_NATIVE_1440P=1`) |
 | **Performance (RTX 4070 Ti 12 GB)** | **Stable 10 FPS** in a newer retail game's open world on an NVIDIA RTX 4070 Ti (12 GB) using `--console series-x` (higher on upper-tier RTX and Radeon GPUs) |
 | **Story Progress** | **Half the story (~50% of a newer retail game's main story)** reachable through the prologue, early missions, and first act |
 | **Rendering & Lighting** | **Close to the console (lit)** — A newer retail game renders lit with textures, shadows, and console Ray-Traced Global Illumination (`ScreenProbes`, `IrradianceCache`, `PrimaryProbes`, `SkyVisibility`, `RaytracingResolve`) via Wave32-compatible `XboxBvhBuilder` and accelerated inline DXIL ray-node traversal; directional screen-space SH radiance fallback is also supported |
@@ -136,6 +137,71 @@ When no XInput controller is connected, the keyboard maps to a standard pad whil
 | `F` / `H` | Stick clicks (L3 / R3) |
 | `Esc`, `Tab` | Menu, View |
 | `F11` or `Alt+Enter` | Toggle windowed / borderless |
+
+---
+
+### Recommended Settings (RTX 4060 8 GB / Ryzen 5 7600 / 32 GB RAM, Native 1440p)
+
+Tested in a newer retail game (`--console series-x`, **9 FPS average**):
+
+```powershell
+# Display & Shader Translation
+$env:XCL_ADAPTER = "nvidia"
+$env:VICTORY_NATIVE_1440P = "1"
+$env:VICTORY_HOST_WAVE = "32"
+$env:VICTORY_EARLY_DEPTH = "1"
+$env:VICTORY_NAN_SCRUB = "1"
+$env:VICTORY_LEAVE_OUT = "02384a60fda6f2d0"
+$env:VICTORY_BVH_MISS = "1"
+
+# Pipeline Warmup & Loading
+$env:VICTORY_PIPELINE_BOOK = "1"
+$env:VICTORY_PIPELINE_WORKERS = "4"
+$env:VICTORY_PIPELINE_WAIT_MS = "4"
+$env:VICTORY_SCREEN_WAIT_MS = "16"
+
+# Submission, Copy-Back & CPU Scheduling
+$env:VICTORY_THIN = "1"
+$env:VICTORY_JOIN_PARTS = "6"
+$env:VICTORY_HELPER_PRIORITY = "1"
+$env:VICTORY_MAP_THREADS = "1"
+$env:VICTORY_RELAY = "2"
+$env:VICTORY_RELAY_COPY = "1"
+$env:VICTORY_WIDE_BACK = "1"
+$env:VICTORY_WC_NO_BACK = "1"
+$env:VICTORY_WC_NO_BACK_MIN_KB = "1024"
+$env:VICTORY_CARD_REHASH_RUNS = "1"
+$env:VICTORY_JOIN_COPIES = "1"
+$env:VICTORY_INDIRECT_WINDOW = "1"
+$env:VICTORY_INDIRECT_BATCH = "2"
+$env:VICTORY_CARD_STEPS = "2"
+$env:VICTORY_CARD_AWAKE = "1"
+$env:VICTORY_UPLOAD_AHEAD = "1"
+$env:VICTORY_SHOW_AFTER = "1"
+$env:VICTORY_GPU_BCPACK = "0"
+
+# VRAM & Texture Residency (8 GB VRAM / 32 GB RAM)
+$env:VICTORY_TEXTURE_POOL = "1"
+$env:VICTORY_TEXTURE_KEEP = "1"
+$env:VICTORY_TEXTURE_NO_WAIT = "1"
+$env:VICTORY_TEXTURE_CATCHUP = "0"
+$env:VICTORY_RIPE_BLOCKS = "0"
+$env:VICTORY_TEXTURE_STAGE_MS = "16"
+$env:VICTORY_TEXTURE_STAGE_MB = "64"
+$env:VICTORY_TEXTURE_AWAY_MS = "3000"
+$env:VICTORY_RAM_IDLE_MS = "2000"
+$env:VICTORY_LEVELS_ON_DEMAND = "0"
+$env:VICTORY_LEVELS_MIN_KB = "256"
+$env:VICTORY_TEXTURE_DROP_MIPS = "1"
+$env:VICTORY_TEXTURE_ROOM_PERCENT = "90"
+$env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = "2048"
+$env:VICTORY_CARD_BUFFERS_MIN_KB = "64"
+
+# Indirect Lighting Fallback
+$env:VICTORY_AMBIENT = "1.0"
+$env:VICTORY_AMBIENT_AIR = "1.5"
+$env:VICTORY_AMBIENT_KEEP_SKY = "1"
+```
 
 ---
 
