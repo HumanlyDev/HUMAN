@@ -19,10 +19,9 @@ An experimental Xbox Series X|S to Windows x86-64 / Direct3D 12 compatibility la
 | **Executable & Boot** | ✅ — A newer retail game executable loads and runs, imports resolve, and boots to its first frame, intro logos, and loading screen |
 | **Main Menu** | ✅ — A newer retail game reaches the main menu and title screen with working controller and keyboard input |
 | **Open World & Playability** | ✅ — A newer retail game loads into story mode and the open world with playable gameplay, character movement, driving, controller input, and pause menu |
-| **Performance (RTX 4060 8 GB)** | **9 FPS average** in a newer retail game on an **NVIDIA RTX 4060 (8 GB)** with **AMD Ryzen 5 7600** and **32 GB RAM** using `--console series-x` at **native 1440p** (`VICTORY_NATIVE_1440P=1`) |
-| **Performance (RTX 4070 Ti 12 GB)** | **Stable 10 FPS** in a newer retail game's open world on an NVIDIA RTX 4070 Ti (12 GB) using `--console series-x` (higher on upper-tier RTX and Radeon GPUs) |
+| **Performance (RTX 4060 8 GB)** | **8 FPS average** in a newer retail game on an **NVIDIA RTX 4060 (8 GB)** with **AMD Ryzen 5 7600** and **32 GB RAM** using `--console series-x` at **native 1440p** (`VICTORY_NATIVE_1440P=1`) |
 | **Story Progress** | **Half the story (~50% of a newer retail game's main story)** reachable through the prologue, early missions, and first act |
-| **Rendering & Lighting** | **Close to the console (lit)** — A newer retail game renders lit with textures, shadows, and console Ray-Traced Global Illumination (`ScreenProbes`, `IrradianceCache`, `PrimaryProbes`, `SkyVisibility`, `RaytracingResolve`) via Wave32-compatible `XboxBvhBuilder` and accelerated inline DXIL ray-node traversal; directional screen-space SH radiance fallback is also supported |
+| **Rendering & Lighting** | **Close to the console (lit)** — A newer retail game renders lit with textures, and shadows. Ray-tracing currently has some issues.
 | **Stability** | **Fully stable, no crashes** — A newer retail game runs stably across sessions with no crashes via Pareto VRAM/commit residency budgets, upload-before-publish bindless barriers, cold BVH arena page recycling, and CPU texture read-back for water/physics |
 
 ---
@@ -98,7 +97,7 @@ Using `Play-HUMAN.cmd` (or `Play-VIctory.cmd` for CGBJ defaults):
 ```powershell
 $env:VICTORY_GAME_DIR = "D:\Games\YourDump"
 
-# Tuned Pareto residency + Ray-Traced Global Illumination (stable 10 FPS on RTX 4070 Ti)
+# Tuned Pareto residency + Ray-Traced Global Illumination (stable 10 FPS on RTX 4070 Ti [outdated metrics])
 .\Play-HUMAN.cmd rt-gi
 
 # Fast Pareto residency with screen-space SH ambient fallback
