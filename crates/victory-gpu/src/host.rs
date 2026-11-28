@@ -795,15 +795,23 @@ fn card_clock_watch(clock: &'static CardClock) {
     }
 }
 
+/// Last computed GPU busy percentage (0..=100), updated by [`card_clock_line`].
+static GPU_LOAD_PCT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub(super) fn gpu_load_pct() -> u32 {
+    GPU_LOAD_PCT.load(Ordering::Relaxed)
+}
+
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
 /// frame's time.
 fn card_clock_line(frames: f64, ms: f64) {
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+    let busy = if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 };
+    GPU_LOAD_PCT.store(busy.round() as u32, Ordering::Relaxed);
     tracing::info!(
-        "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
+        "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {busy:.0}% busy by this count), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
          had not submitted; the submitting thread stood waiting for the card {stood:.1} ms",
-        if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 }
     );
 }
 
@@ -3767,8 +3775,10 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
+mod fps;
 #[cfg(feature = "diagnostics")]
 mod panel;
+mod textbox;
 mod place;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
@@ -8864,6 +8874,7 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     composer: Option<crate::compose::Composer>,
+    fps: fps::FpsOverlay,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
@@ -9428,6 +9439,7 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
+            p.fps.draw(self, copy, &back, (width, height), format);
             #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
@@ -9477,6 +9489,7 @@ impl Host {
             let mut showing = crate::timeline::span("the host's Present");
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");
+            p.fps.frame();
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
             p.meter.frame(p.hwnd);
@@ -9532,6 +9545,7 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
+                fps: fps::FpsOverlay::new(),
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })
